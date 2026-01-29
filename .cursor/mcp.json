@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "bigquery": {
+      "type": "stdio",
+      "command": "${workspaceFolder}/bin/toolbox",
+      "args": ["--prebuilt", "bigquery", "--stdio"],
+      "env": {
+        "BIGQUERY_PROJECT": "i-dss-streaming-data"
+      }
+    }
+  }
+}
