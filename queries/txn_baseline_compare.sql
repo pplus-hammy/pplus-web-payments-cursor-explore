@@ -1,60 +1,107 @@
--- Baseline: Jan 1–Jan 18 transaction volume per cc_first_6_nbr (count distinct transaction_guid).
--- Compare to daily volume per cc_first_6_nbr for Jan 19–Jan 31; report large increases or decreases.
+-- Baseline: variable date range for transaction volume per cc_first_6_nbr (count distinct transaction_guid).
+-- Compare to daily volume per cc_first_6_nbr for days after baseline; report volume_change and pct_change.
 -- Uses same dataset/filters as txn.sql.
 
-with txn as (
-    select
-        transaction_guid,
-        trans_dt,
-        cc_first_6_nbr
-    from `i-dss-streaming-data.payment_ops_vw.recurly_transaction_fct` txn
-    where 1 = 1
-        and txn.src_system_id = 115
-        and txn.trans_dt >= date('2026-01-01')
-        and txn.trans_dt <= date('2026-01-31')
-        and txn.trans_type_desc in ('purchase', 'verify')
-        and txn.trans_status_desc in ('success', 'void', 'declined')
-        and txn.origin_desc in ('api', 'token_api')
-        and txn.cc_first_6_nbr in ('601100', '601101', '414720')
-),
+declare baseline_start date default date('2025-10-15');
+declare baseline_end date default date('2026-01-15');
 
--- Baseline: total distinct transactions per BIN over Jan 1–18, then daily average
-baseline as (
-    select
-        cc_first_6_nbr,
-        count(distinct transaction_guid) as baseline_total_txns,
-        count(distinct transaction_guid) / 18.0 as baseline_daily_avg
-    from txn
-    where trans_dt between date('2026-01-01') and date('2026-01-18')
-    group by cc_first_6_nbr
-),
+with txn as 
+    (
+        select
+            src_system_id
+            , account_cd	
+            , subscription_guid	
+            , invoice_guid	
+            , transaction_guid
+            , trans_dt	
+            , trans_dt_ut	
+            , origin_desc
+            , trans_type_desc	
+            , trans_status_desc	
+            , trans_amt	
+            , tax_amt	
+            , currency_cd	
+            , country_cd
+            , trans_gateway_type_desc	
+            , gateway_cd	
+            , gateway_error_cd	
+            , failure_type	
+            -- , processor_response_cd	
+            -- , issuer_response_cd	
+            , payment_method_desc	
+            , cc_type_desc
+            , cc_first_6_nbr	
+            , card_brand_nm	
+            , card_type_cd	
+            , card_level_cd	
+            , card_issuer_nm	
+            , card_issuing_country_cd	
+            -- , cc_last_4	
+            -- , cc_exp_mth	
+            -- , cc_exp_yr
+            , approval_desc
+            , trans_msg_desc
+            -- , cc_payment_id
+            , reference_cd
+        from i-dss-streaming-data.payment_ops_vw.recurly_transaction_fct txn
+        where 1=1
+            and txn.src_system_id = 115
+            and txn.trans_dt >= baseline_start
+            and txn.trans_dt <= date('2026-01-31')
+            and txn.trans_type_desc in ('purchase', 'verify')
+            and txn.trans_status_desc in ('success', 'void', 'declined')
+            and txn.origin_desc in ('api', 'token_api')
+            and txn.cc_first_6_nbr in ('601100', '601101', '414720')
+    )
 
--- Daily volume per BIN for Jan 19–31
-daily_volume as (
-    select
-        trans_dt,
-        cc_first_6_nbr,
-        count(distinct transaction_guid) as daily_txn_cnt
-    from txn
-    where trans_dt between date('2026-01-19') and date('2026-01-31')
-    group by trans_dt, cc_first_6_nbr
-)
+, baseline as 
+    (
+        select
+            cc_first_6_nbr
+            , count(distinct transaction_guid) as baseline_total_txns
+            , count(distinct transaction_guid) / (date_diff(baseline_end, baseline_start, day) + 1) as baseline_daily_avg
+        from txn
+        where 1=1 
+            and trans_dt between baseline_start and baseline_end
+        group by cc_first_6_nbr
+    )
 
+, daily_volume as 
+    (
+        select
+            trans_dt
+            , cc_first_6_nbr
+            , count(distinct transaction_guid) as daily_txn_cnt
+        from txn
+        where 1=1
+            and trans_dt > baseline_end
+            and trans_dt < date_add(current_date, interval 1 day)
+        group by trans_dt, cc_first_6_nbr
+    )
+
+, chg_chk as 
+    (
+        select
+            dv.trans_dt
+            , dv.cc_first_6_nbr
+            , bl.baseline_total_txns
+            , round(bl.baseline_daily_avg, 1) as baseline_daily_avg
+            , dv.daily_txn_cnt
+            , round(dv.daily_txn_cnt - bl.baseline_daily_avg, 1) as volume_change
+            , round((dv.daily_txn_cnt - bl.baseline_daily_avg) / nullif(bl.baseline_daily_avg, 0) * 100, 1) as pct_change
+            , case
+                when (dv.daily_txn_cnt - bl.baseline_daily_avg) / nullif(bl.baseline_daily_avg, 0) >= 0.50 then 'large_increase'
+                when (dv.daily_txn_cnt - bl.baseline_daily_avg) / nullif(bl.baseline_daily_avg, 0) <= -0.50 then 'large_decrease'
+                else null
+            end as chg_flag
+        from daily_volume dv
+        join baseline bl
+            on dv.cc_first_6_nbr = bl.cc_first_6_nbr
+        where 1=1
+    )
 select
-    d.trans_dt,
-    d.cc_first_6_nbr,
-    b.baseline_total_txns,
-    round(b.baseline_daily_avg, 1) as baseline_daily_avg,
-    d.daily_txn_cnt,
-    round(d.daily_txn_cnt - b.baseline_daily_avg, 1) as volume_change,
-    round((d.daily_txn_cnt - b.baseline_daily_avg) / nullif(b.baseline_daily_avg, 0) * 100, 1) as pct_change,
-    case
-        when (d.daily_txn_cnt - b.baseline_daily_avg) / nullif(b.baseline_daily_avg, 0) >= 0.50 then 'large_increase'
-        when (d.daily_txn_cnt - b.baseline_daily_avg) / nullif(b.baseline_daily_avg, 0) <= -0.50 then 'large_decrease'
-        else 'within_range'
-    end as flag
-from daily_volume d
-join baseline b
-    on d.cc_first_6_nbr = b.cc_first_6_nbr
-order by d.trans_dt,
-    d.cc_first_6_nbr;
+    *
+from chg_chk
+where 1=1
+    and chg_flag is not null
+order by 1 desc, 2
