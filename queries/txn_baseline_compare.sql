@@ -58,8 +58,10 @@ with txn as
     (
         select
             cc_first_6_nbr
-            , count(distinct transaction_guid) as baseline_total_txns
-            , count(distinct transaction_guid) / (date_diff(baseline_end, baseline_start, day) + 1) as baseline_daily_avg
+            , count(distinct transaction_guid) as baseline_tot_ct
+            , cast(count(distinct transaction_guid) / (date_diff(baseline_end, baseline_start, day) + 1) as integer) as baseline_avg_ct
+            , count(distinct case when trans_status_desc in ('success', 'void') then transaction_guid else null end) as baseline_success_tot_ct
+            , cast(count(distinct case when trans_status_desc in ('success', 'void') then transaction_guid else null end) / (date_diff(baseline_end, baseline_start, day) + 1) as integer) as baseline_success_avg_ct
         from txn
         where 1=1 
             and trans_dt between baseline_start and baseline_end
@@ -71,7 +73,8 @@ with txn as
         select
             trans_dt
             , cc_first_6_nbr
-            , count(distinct transaction_guid) as daily_txn_cnt
+            , count(distinct transaction_guid) as daily_ct
+            , count(distinct case when trans_status_desc in ('success', 'void') then transaction_guid else null end) as daily_success_ct
         from txn
         where 1=1
             and trans_dt > baseline_end
@@ -84,16 +87,28 @@ with txn as
         select
             dv.trans_dt
             , dv.cc_first_6_nbr
-            , bl.baseline_total_txns
-            , round(bl.baseline_daily_avg, 1) as baseline_daily_avg
-            , dv.daily_txn_cnt
-            , round(dv.daily_txn_cnt - bl.baseline_daily_avg, 1) as volume_change
-            , round((dv.daily_txn_cnt - bl.baseline_daily_avg) / nullif(bl.baseline_daily_avg, 0) * 100, 1) as pct_change
+
+            , bl.baseline_success_avg_ct
+            , dv.daily_success_ct
+            , cast((dv.daily_success_ct - bl.baseline_success_avg_ct) as integer) as success_diff
+            , round((dv.daily_success_ct - bl.baseline_success_avg_ct) / nullif(bl.baseline_success_avg_ct, 0) * 100, 2) as success_pct_chg
             , case
-                when (dv.daily_txn_cnt - bl.baseline_daily_avg) / nullif(bl.baseline_daily_avg, 0) >= 0.50 then 'large_increase'
-                when (dv.daily_txn_cnt - bl.baseline_daily_avg) / nullif(bl.baseline_daily_avg, 0) <= -0.50 then 'large_decrease'
+                when (dv.daily_success_ct - bl.baseline_success_avg_ct) / nullif(bl.baseline_success_avg_ct, 0) >= .5 then 'large_increase'
+                when (dv.daily_success_ct - bl.baseline_success_avg_ct) / nullif(bl.baseline_success_avg_ct, 0) <= -.5 then 'large_decrease'
+                else null
+            end as success_chg_flag
+
+            , bl.baseline_tot_ct
+            , bl.baseline_avg_ct
+            , dv.daily_ct
+            , cast((dv.daily_ct - bl.baseline_avg_ct) as integer) as vol_diff
+            , round((dv.daily_ct - bl.baseline_avg_ct) / nullif(bl.baseline_avg_ct, 0) * 100, 2) as pct_change
+            , case
+                when (dv.daily_ct - bl.baseline_avg_ct) / nullif(bl.baseline_avg_ct, 0) >= 0.50 then 'large_increase'
+                when (dv.daily_ct - bl.baseline_avg_ct) / nullif(bl.baseline_avg_ct, 0) <= -0.50 then 'large_decrease'
                 else null
             end as chg_flag
+
         from daily_volume dv
         join baseline bl
             on dv.cc_first_6_nbr = bl.cc_first_6_nbr
@@ -103,5 +118,10 @@ select
     *
 from chg_chk
 where 1=1
-    and chg_flag is not null
+    and 
+        (
+            chg_flag is not null
+            or
+            success_chg_flag is not null
+        )
 order by 1 desc, 2
