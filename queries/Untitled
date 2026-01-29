@@ -1,0 +1,43 @@
+select
+    src_system_id
+    , account_cd	
+    , subscription_guid	
+    , invoice_guid	
+    , transaction_guid
+    , trans_dt	
+    , trans_dt_ut	
+    , origin_desc
+    , trans_type_desc	
+    , trans_status_desc	
+    , trans_amt	
+    , tax_amt	
+    , currency_cd	
+    , country_cd
+    , trans_gateway_type_desc	
+    , gateway_cd	
+    , gateway_error_cd	
+    , failure_type	
+    -- , processor_response_cd	
+    -- , issuer_response_cd	
+    , payment_method_desc	
+    , cc_type_desc
+    , cc_first_6_nbr	
+    , card_brand_nm	
+    , card_type_cd	
+    , card_level_cd	
+    , card_issuer_nm	
+    , card_issuing_country_cd	
+    -- , cc_last_4	
+    -- , cc_exp_mth	
+    -- , cc_exp_yr
+    , approval_desc
+    , trans_msg_desc
+    -- , cc_payment_id
+    , reference_cd
+from i-dss-streaming-data.payment_ops_vw.recurly_transaction_fct txn
+where 1=1
+    and txn.src_system_id = 115
+    and txn.trans_dt >= date('2026-01-01')
+    and txn.trans_type_desc in ('purchase','verify')
+    and txn.trans_status_desc in ('success', 'void', 'declined')
+    and txn.origin_desc in ('api','token_api')
