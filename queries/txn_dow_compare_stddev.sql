@@ -2,10 +2,10 @@
 -- For each run date, baseline = same day-of-week in rolling 3-month lookback (excl. run date); flag anomalies by z-score.
 -- Run range is variable (default last 14 days). Uses same dataset/filters as txn.sql. Optional excluded_dts drops dates from baseline.
 
-declare run_range_end date default date_sub(current_date(), interval 1 day);
-declare run_range_start date default date_add(run_range_end, interval -14 day);
-declare z_threshold float64 default 2;
-declare excluded_dts array<date> default [date('2999-12-31')]; -- days to exclude from baseline (like big event days)
+declare run_range_end date default date_add(current_date(), interval -1 day);
+declare run_range_start date default date_add(run_range_end, interval -13 day);
+declare z_threshold float64 default 3;
+declare excluded_dts array<date> default [date('2026-01-24'), date('2999-12-31')]; -- days to exclude from baseline (like big event days)
 
 with txn as
     (
@@ -42,12 +42,13 @@ with txn as
         from i-dss-streaming-data.payment_ops_vw.recurly_transaction_fct txn
         where 1=1
             and txn.src_system_id = 115
-            and txn.trans_dt >= date_sub(run_range_start, interval 3 month)
+            and txn.trans_dt >= date_add(run_range_start, interval -3 month)
             and txn.trans_dt <= run_range_end
             and txn.trans_type_desc in ('purchase', 'verify')
             and txn.trans_status_desc in ('success', 'void', 'declined')
             and txn.origin_desc in ('api', 'token_api')
-            and txn.cc_first_6_nbr in ('601100', '601101', '414720')
+            -- and txn.cc_first_6_nbr in ('601100', '601101', '414720')
+            and txn.payment_method_desc = 'Credit Card'
     )
 
 , run_dates as
@@ -74,6 +75,10 @@ with txn as
             , cc_first_6_nbr
             , count(distinct transaction_guid) as daily_ct
             , count(distinct case when trans_status_desc in ('success', 'void') then transaction_guid else null end) as daily_success_ct
+            , min(case when trans_status_desc in ('success', 'void') then account_cd else null end) as success_acct_ex1
+            , max(case when trans_status_desc in ('success', 'void') then account_cd else null end) as success_acct_ex2
+            , min(case when trans_status_desc in ('declined') then account_cd else null end) as decline_acct_ex1
+            , max(case when trans_status_desc in ('declined') then account_cd else null end) as decline_acct_ex2
         from txn
         where 1=1
             and trans_dt >= date_sub(run_range_start, interval 3 month)
@@ -88,13 +93,14 @@ with txn as
             bd.run_dt
             , dva.cc_first_6_nbr
             , cast(avg(dva.daily_ct) as int64) as baseline_avg_ct
-            , stddev_samp(dva.daily_ct) as baseline_stddev_ct
+            , cast(stddev_samp(dva.daily_ct) as int64) as baseline_stddev_ct
             , cast(avg(dva.daily_success_ct) as int64) as baseline_success_avg_ct
-            , stddev_samp(dva.daily_success_ct) as baseline_success_stddev_ct
+            , cast(stddev_samp(dva.daily_success_ct) as int64) as baseline_success_stddev_ct
         from baseline_dates bd
         join daily_volume_all dva
             on bd.baseline_dt = dva.trans_dt
         where 1=1
+            and bd.baseline_dt not in unnest(excluded_dts)
         group by bd.run_dt, dva.cc_first_6_nbr
     )
 
@@ -105,6 +111,10 @@ with txn as
             , cc_first_6_nbr
             , daily_ct
             , daily_success_ct
+            , success_acct_ex1
+            , success_acct_ex2
+            , decline_acct_ex1
+            , decline_acct_ex2
         from daily_volume_all
         where 1=1
             and trans_dt between run_range_start and run_range_end
@@ -137,6 +147,10 @@ with txn as
                 when (dv.daily_ct - bl.baseline_avg_ct) / nullif(bl.baseline_stddev_ct, 0) <= -z_threshold then 'large_decrease'
                 else null
             end as chg_flag
+            , success_acct_ex1
+            , success_acct_ex2
+            , decline_acct_ex1
+            , decline_acct_ex2
 
         from daily_volume dv
         join dow_baseline bl
@@ -148,6 +162,7 @@ select
     *
 from chg_chk
 where 1=1
+    and baseline_avg_ct >= 500
     and
         (
             chg_flag is not null
