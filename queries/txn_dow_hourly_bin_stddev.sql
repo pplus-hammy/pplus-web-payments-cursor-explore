@@ -2,8 +2,8 @@
 -- For each run date and hour, baseline = same day-of-week and same hour in rolling 3-month lookback (excl. run date); flag anomalies by z-score.
 -- Run range is variable (default last 14 days). Uses same dataset/filters as txn.sql. Optional excluded_dts drops dates from baseline.
 
-declare run_range_end date default date_add(current_date(), interval -1 day);
-declare run_range_start date default date_add(run_range_end, interval -13 day);
+declare run_range_end date default date_add(current_date(), interval 0 day);
+declare run_range_start date default date_add(run_range_end, interval -14 day);
 declare z_threshold float64 default 3;
 declare excluded_dts array<date> default [date('2026-01-24'), date('2999-12-31')]; -- days to exclude from baseline (like big event days)
 
@@ -53,7 +53,7 @@ with txn as
                             , subscription_id as subscription_guid	
                             , invoice_id as invoice_guid	
                             , transaction_id as transaction_guid
-                            , date(date) as trans_dt	
+                            , date(datetime(date, 'America/Los_Angeles')) as trans_dt	
                             , date as trans_dt_ut	
                             , origin as origin_desc
                             , type as trans_type_desc	
@@ -70,7 +70,7 @@ with txn as
                             -- , issuer_response_code as issuer_response_cd	
                             , payment_method as payment_method_desc	
                             , cc_type as cc_type_desc
-                            , cast(cc_first_6 as string) as cc_first_6_nbr	
+                            , cast(round(cast(cc_first_6 as float64),0) as string) as cc_first_6_nbr	
                             , card_brand as card_brand_nm	
                             , card_type as card_type_cd	
                             , card_level as card_level_cd	
@@ -85,10 +85,10 @@ with txn as
                             , reference as reference_cd
                         from i-dss-streaming-data.payment_ops_sandbox.transactions_to_bq
                         where 1=1
+                            and src_system_id = 115
                             and type in ('purchase','verify')
                             and status in ('success', 'void', 'declined')
-                            and src_system_id in (115, 134)
-
+                            
                         union all
 
                         select
@@ -129,9 +129,10 @@ with txn as
                             , reference_cd
                         from i-dss-streaming-data.payment_ops_vw.recurly_transaction_fct txn
                         where 1=1
-                            and txn.src_system_id in (115, 134)
+                            and txn.src_system_id in (115)
                             -- and txn.trans_dt >= date('2025-04-01')
-                            and txn.trans_dt >= date('2026-01-01')
+                            and txn.trans_dt >= date_add(run_range_start, interval -3 month)
+                            and txn.trans_dt <= run_range_end
                             and txn.trans_type_desc in ('purchase','verify')
                             and txn.trans_status_desc in ('success', 'void', 'declined')
                     ) txn
