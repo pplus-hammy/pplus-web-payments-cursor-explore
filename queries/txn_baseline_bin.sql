@@ -40,12 +40,13 @@ with txn as
             -- , cc_exp_mth	
             -- , cc_exp_yr
             , approval_desc
+            , avs_result_cd
             , trans_msg_desc
             -- , cc_payment_id
             , reference_cd
         from i-dss-streaming-data.payment_ops_vw.recurly_transaction_fct txn
         where 1=1
-            and txn.src_system_id = 115
+            -- and txn.src_system_id = 115
             and txn.trans_dt >= baseline_start
             and txn.trans_dt <= date('2026-01-31')
             and txn.trans_type_desc in ('purchase', 'verify')
@@ -57,7 +58,8 @@ with txn as
 , baseline as 
     (
         select
-            cc_first_6_nbr
+            src_system_id
+            , cc_first_6_nbr
             , count(distinct transaction_guid) as baseline_tot_ct
             , cast(count(distinct transaction_guid) / (date_diff(baseline_end, baseline_start, day) + 1) as integer) as baseline_avg_ct
             , count(distinct case when trans_status_desc in ('success', 'void') then transaction_guid else null end) as baseline_success_tot_ct
@@ -65,13 +67,14 @@ with txn as
         from txn
         where 1=1 
             and trans_dt between baseline_start and baseline_end
-        group by cc_first_6_nbr
+        group by src_system_id, cc_first_6_nbr
     )
 
 , daily_volume as 
     (
         select
-            trans_dt
+            src_system_id
+            , trans_dt
             , cc_first_6_nbr
             , count(distinct transaction_guid) as daily_ct
             , count(distinct case when trans_status_desc in ('success', 'void') then transaction_guid else null end) as daily_success_ct
@@ -79,13 +82,14 @@ with txn as
         where 1=1
             and trans_dt > baseline_end
             and trans_dt < date_add(current_date, interval 1 day)
-        group by trans_dt, cc_first_6_nbr
+        group by src_system_id, trans_dt, cc_first_6_nbr
     )
 
 , chg_chk as 
     (
         select
-            dv.trans_dt
+            dv.src_system_id
+            , dv.trans_dt
             , dv.cc_first_6_nbr
 
             , bl.baseline_success_avg_ct
@@ -111,7 +115,8 @@ with txn as
 
         from daily_volume dv
         join baseline bl
-            on dv.cc_first_6_nbr = bl.cc_first_6_nbr
+            on dv.src_system_id = bl.src_system_id
+            and dv.cc_first_6_nbr = bl.cc_first_6_nbr
         where 1=1
     )
 select
@@ -124,4 +129,4 @@ where 1=1
             or
             success_chg_flag is not null
         )
-order by 1 desc, 2
+order by 1, 2 desc, 3

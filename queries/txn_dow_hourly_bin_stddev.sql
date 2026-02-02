@@ -18,6 +18,7 @@ with txn as
             , trans_dt
             , trans_dt_ut
             , extract(hour from datetime(trans_dt_ut, 'America/Los_Angeles')) as trans_hr
+            -- , max(case when trans_dt = date(current_datetime('America/Los_Angeles')) then extract(hour from datetime(trans_dt_ut, 'America/Los_Angeles')) else null end) as max_hr
             , origin_desc
             , trans_type_desc
             , trans_status_desc
@@ -80,12 +81,13 @@ with txn as
                             -- , expire_month as cc_exp_mth	
                             -- , expire_year as cc_exp_yr
                             , approval_code as approval_desc
+                            , avs_result as avs_result_cd
                             , message as trans_msg_desc
                             -- , payment_method_identifier as cc_payment_id
                             , reference as reference_cd
                         from i-dss-streaming-data.payment_ops_sandbox.transactions_to_bq
                         where 1=1
-                            and src_system_id = 115
+                            -- and src_system_id = 115
                             and type in ('purchase','verify')
                             and status in ('success', 'void', 'declined')
                             
@@ -124,12 +126,13 @@ with txn as
                             -- , cc_exp_mth	
                             -- , cc_exp_yr
                             , approval_desc
+                            , avs_result_cd
                             , trans_msg_desc
                             -- , cc_payment_id
                             , reference_cd
                         from i-dss-streaming-data.payment_ops_vw.recurly_transaction_fct txn
                         where 1=1
-                            and txn.src_system_id in (115)
+                            -- and txn.src_system_id in (115)
                             -- and txn.trans_dt >= date('2025-04-01')
                             and txn.trans_dt >= date_add(run_range_start, interval -3 month)
                             and txn.trans_dt <= run_range_end
@@ -138,7 +141,6 @@ with txn as
                     ) txn
             ) txn
         where 1=1
-            and txn.src_system_id = 115
             and txn.trans_dt >= date_add(run_range_start, interval -3 month)
             and txn.trans_dt <= run_range_end
             and txn.trans_type_desc in ('purchase', 'verify')
@@ -146,6 +148,18 @@ with txn as
             and txn.origin_desc in ('api', 'token_api')
             -- and txn.cc_first_6_nbr in ('601100', '601101', '414720')
             and txn.payment_method_desc = 'Credit Card'
+    )
+
+, max_hr as
+    (
+        select
+            src_system_id
+            , trans_dt
+            , max(extract(hour from datetime(trans_dt_ut, 'America/Los_Angeles'))) as max_hr
+        from txn
+        where 1=1
+            and trans_dt = date(current_datetime('America/Los_Angeles'))
+        group by all
     )
 
 , run_dates as
@@ -168,7 +182,8 @@ with txn as
 , hourly_volume_all as
     (
         select
-            trans_dt
+            src_system_id
+            , trans_dt
             , trans_hr
             , cc_first_6_nbr
             , count(distinct transaction_guid) as hourly_ct
@@ -182,13 +197,14 @@ with txn as
             and trans_dt >= date_sub(run_range_start, interval 3 month)
             and trans_dt <= run_range_end
             and trans_dt not in unnest(excluded_dts)
-        group by trans_dt, trans_hr, cc_first_6_nbr
+        group by src_system_id, trans_dt, trans_hr, cc_first_6_nbr
     )
 
 , dow_hour_baseline as
     (
         select
-            bd.run_dt
+            hva.src_system_id
+            , bd.run_dt
             , hva.trans_hr
             , hva.cc_first_6_nbr
             , cast(avg(hva.hourly_ct) as int64) as baseline_avg_ct
@@ -200,13 +216,14 @@ with txn as
             on bd.baseline_dt = hva.trans_dt
         where 1=1
             and bd.baseline_dt not in unnest(excluded_dts)
-        group by bd.run_dt, hva.trans_hr, hva.cc_first_6_nbr
+        group by hva.src_system_id, bd.run_dt, hva.trans_hr, hva.cc_first_6_nbr
     )
 
 , hourly_volume as
     (
         select
-            trans_dt
+            src_system_id
+            , trans_dt
             , trans_hr
             , cc_first_6_nbr
             , hourly_ct
@@ -223,7 +240,8 @@ with txn as
 , chg_chk as
     (
         select
-            hv.trans_dt
+            hv.src_system_id
+            , hv.trans_dt
             , hv.trans_hr
             , hv.cc_first_6_nbr
 
@@ -255,7 +273,8 @@ with txn as
 
         from hourly_volume hv
         join dow_hour_baseline bl
-            on hv.trans_dt = bl.run_dt
+            on hv.src_system_id = bl.src_system_id
+            and hv.trans_dt = bl.run_dt
             and hv.trans_hr = bl.trans_hr
             and hv.cc_first_6_nbr = bl.cc_first_6_nbr
         where 1=1
@@ -263,6 +282,10 @@ with txn as
 select
     *
 from chg_chk
+join max_hr mh
+    on hv.src_system_id = mh.src_system_id
+    and hv.trans_dt = mh.trans_dt
+    and hv.trans_hr = mh.max_hr
 where 1=1
     and baseline_avg_ct >= 20
     and
@@ -271,4 +294,4 @@ where 1=1
             or
             success_chg_flag is not null
         )
-order by 1 desc, 2 desc, vol_z_score desc
+order by 1, 2 desc, 3, 4, 5

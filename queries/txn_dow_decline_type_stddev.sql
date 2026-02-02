@@ -37,11 +37,12 @@ with txn as
             , card_issuer_nm
             , card_issuing_country_cd
             , approval_desc
+            , avs_result_cd
             , trans_msg_desc
             , reference_cd
         from i-dss-streaming-data.payment_ops_vw.recurly_transaction_fct txn
         where 1=1
-            and txn.src_system_id = 115
+            -- and txn.src_system_id = 115
             and txn.trans_dt >= date_add(run_range_start, interval -3 month)
             and txn.trans_dt <= run_range_end
             and txn.trans_type_desc in ('purchase', 'verify')
@@ -71,7 +72,8 @@ with txn as
 , daily_volume_all as
     (
         select
-            trans_dt
+            src_system_id
+            , trans_dt
             , failure_type
             , gateway_error_cd
             , count(distinct transaction_guid) as daily_ct
@@ -82,13 +84,14 @@ with txn as
             and trans_dt >= date_sub(run_range_start, interval 3 month)
             and trans_dt <= run_range_end
             and trans_dt not in unnest(excluded_dts)
-        group by trans_dt, failure_type, gateway_error_cd
+        group by src_system_id, trans_dt, failure_type, gateway_error_cd
     )
 
 , dow_baseline as
     (
         select
-            bd.run_dt
+            dva.src_system_id
+            , bd.run_dt
             , dva.failure_type
             , dva.gateway_error_cd
             , cast(avg(dva.daily_ct) as int64) as baseline_avg_ct
@@ -98,13 +101,14 @@ with txn as
             on bd.baseline_dt = dva.trans_dt
         where 1=1
             and bd.baseline_dt not in unnest(excluded_dts)
-        group by bd.run_dt, dva.failure_type, dva.gateway_error_cd
+        group by dva.src_system_id, bd.run_dt, dva.failure_type, dva.gateway_error_cd
     )
 
 , daily_volume as
     (
         select
-            trans_dt
+            src_system_id
+            , trans_dt
             , failure_type
             , gateway_error_cd
             , daily_ct
@@ -118,7 +122,8 @@ with txn as
 , chg_chk as
     (
         select
-            dv.trans_dt
+            dv.src_system_id
+            , dv.trans_dt
             , dv.gateway_error_cd
             , dv.failure_type
             
@@ -137,7 +142,8 @@ with txn as
 
         from daily_volume dv
         join dow_baseline bl
-            on dv.trans_dt = bl.run_dt
+            on dv.src_system_id = bl.src_system_id
+            and dv.trans_dt = bl.run_dt
             and dv.failure_type = bl.failure_type
             and (dv.gateway_error_cd is not distinct from bl.gateway_error_cd)
         where 1=1
@@ -148,4 +154,4 @@ from chg_chk
 where 1=1
     and baseline_avg_ct >= 500
     and chg_flag is not null
-order by 1 desc, 2, 3
+order by 1, 2 desc, 3, 4, 5

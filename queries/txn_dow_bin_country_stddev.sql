@@ -11,6 +11,20 @@ with txn as
     (
         select
             src_system_id
+            , case
+                when txn.gateway_cd in ('cljvv4pluxdo', 'i3z3apzipbp7', 'wf3nj05ig027', 'o8kozk9x9qb0') then 'US'
+                when txn.gateway_cd in ('p3oy7jtrnbzu', 'jt7jdrftfjyv') then 'AU'
+                when txn.gateway_cd in ('ob5kihh2l5ht', 'ob5lkextdfrs') then 'LATAM'
+                when txn.gateway_cd in ('qpdcpwym9258', 'qwazckp2zkjj', 't0gcwmn4afqk') then 'UK'
+                when txn.gateway_cd = 'obkq1bdafejc' then 'BR'
+                when txn.gateway_cd = 'inkqcylsbc8b' then 'CA'
+                when txn.gateway_cd in ('sj7av2xpiqik', 'rnuns7r579dp', 'rnuoyv9lls4l', 'rnum8iuze17e', 'rnunet43fjj0', 'rnuplcrtgiuv', 'rnupcldy1szk') then 'GSA_DE_AT_CH'
+                when txn.gateway_cd = 'pnpypk0ag0nv' then 'MX'
+                when txn.gateway_cd = 'rs7oav8d5e0f' then 'FR'
+                when txn.gateway_cd in ('qpdel7kior3j', 'qwazjh3p96l7') then 'IE'
+                when txn.gateway_cd in ('reyg6kvzzovm', 'ra6ffzgs9s8q', 't0h4mkezczbd') then 'IT'
+                else txn.gateway_cd
+            end as gateway_country
             , account_cd
             , subscription_guid
             , invoice_guid
@@ -73,6 +87,7 @@ with txn as
     (
         select
             src_system_id
+            , gateway_country
             , trans_dt
             , cc_first_6_nbr
             , count(distinct transaction_guid) as daily_ct
@@ -86,13 +101,14 @@ with txn as
             and trans_dt >= date_sub(run_range_start, interval 3 month)
             and trans_dt <= run_range_end
             and trans_dt not in unnest(excluded_dts)
-        group by src_system_id, trans_dt, cc_first_6_nbr
+        group by src_system_id, gateway_country, trans_dt, cc_first_6_nbr
     )
 
 , dow_baseline as
     (
         select
             dva.src_system_id
+            , dva.gateway_country
             , bd.run_dt
             , dva.cc_first_6_nbr
             , cast(avg(dva.daily_ct) as int64) as baseline_avg_ct
@@ -104,13 +120,14 @@ with txn as
             on bd.baseline_dt = dva.trans_dt
         where 1=1
             and bd.baseline_dt not in unnest(excluded_dts)
-        group by dva.src_system_id, bd.run_dt, dva.cc_first_6_nbr
+        group by dva.src_system_id, dva.gateway_country, bd.run_dt, dva.cc_first_6_nbr
     )
 
 , daily_volume as
     (
         select
             src_system_id
+            , gateway_country
             , trans_dt
             , cc_first_6_nbr
             , daily_ct
@@ -128,6 +145,7 @@ with txn as
     (
         select
             dv.src_system_id
+            , dv.gateway_country
             , dv.trans_dt
             , dv.cc_first_6_nbr
 
@@ -162,6 +180,7 @@ with txn as
             on dv.src_system_id = bl.src_system_id
             and dv.trans_dt = bl.run_dt
             and dv.cc_first_6_nbr = bl.cc_first_6_nbr
+            and dv.gateway_country = bl.gateway_country
         where 1=1
     )
 select
@@ -175,4 +194,4 @@ where 1=1
             or
             success_chg_flag is not null
         )
-order by 1, 2 desc, 3
+order by 1, 2, 3 desc, 4
