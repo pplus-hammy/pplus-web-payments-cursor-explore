@@ -1,2 +1,5 @@
 # MCP Toolbox binary (install with scripts/download-toolbox.sh)
 bin/
+
+# Env file (SMTP_*, BIGQUERY_PROJECT) — do not commit secrets
+.env

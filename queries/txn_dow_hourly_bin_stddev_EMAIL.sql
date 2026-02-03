@@ -280,7 +280,19 @@ with txn as
         where 1=1
     )
 select
-    *
+    case
+        when cc.src_system_id = 115 then 'US'
+        when cc.src_system_id = 134 then 'INTL'
+        else 'Legacy AU'
+    end as geo
+    , cc.trans_dt as dt
+    , cc.trans_hr as hr
+    , cc_first_6_nbr as BIN
+    , baseline_avg_ct as `Average Count`
+    , baseline_stddev_ct as `Std Deviation`
+    , hourly_ct as `Hourly Count`
+    , vol_diff as `Diff`
+    , vol_z_score as `Z Score`
 from chg_chk cc
 join max_hr mh
     on cc.src_system_id = mh.src_system_id
