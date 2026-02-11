@@ -53,7 +53,7 @@ from google.cloud import bigquery
 load_dotenv(_root / ".env")
 
 # Fixed recipient: Slack channel email (emails post to channel)
-SLACK_CHANNEL_EMAIL = "d2c-payment-fraud-mon-aaaatanf5wtlalz6jddjekf3pe@paramountglobal.org.slack.com"
+SLACK_CHANNEL_EMAIL = "d2c-payment-fraud-mon-aaaataszrj4abmr3bo6izkb4n4@paramountglobal.org.slack.com"
 
 
 def repo_root() -> Path:

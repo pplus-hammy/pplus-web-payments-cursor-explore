@@ -75,12 +75,16 @@ with txn as
             src_system_id
             , trans_dt
             , cc_first_6_nbr
-            , count(distinct transaction_guid) as daily_ct
-            , count(distinct case when trans_status_desc in ('success', 'void') then transaction_guid else null end) as daily_success_ct
+            , count(distinct account_cd) as daily_ct
+            , count(distinct case when trans_status_desc in ('success', 'void') then account_cd else null end) as daily_success_ct
+            , count(distinct case when trans_status_desc in ('success', 'void') and avs_result_cd not in ('Y','X','V') then account_cd else null end) as daily_success_avs_fail_ct
+            , count(distinct case when trans_status_desc = 'declined' then account_cd else null end) as daily_decline_ct
             , min(case when trans_status_desc in ('success', 'void') then account_cd else null end) as success_acct_ex1
             , max(case when trans_status_desc in ('success', 'void') then account_cd else null end) as success_acct_ex2
             , min(case when trans_status_desc in ('declined') then account_cd else null end) as decline_acct_ex1
             , max(case when trans_status_desc in ('declined') then account_cd else null end) as decline_acct_ex2
+            , min(case when trans_status_desc in ('success', 'void') and avs_result_cd not in ('Y','X','V') then account_cd else null end) as success_avs_fail_ex1
+            , max(case when trans_status_desc in ('success', 'void') and avs_result_cd not in ('Y','X','V') then account_cd else null end) as success_avs_fail_ex2  
         from txn
         where 1=1
             and trans_dt >= date_sub(run_range_start, interval 3 month)
@@ -99,6 +103,10 @@ with txn as
             , cast(stddev_samp(dva.daily_ct) as int64) as baseline_stddev_ct
             , cast(avg(dva.daily_success_ct) as int64) as baseline_success_avg_ct
             , cast(stddev_samp(dva.daily_success_ct) as int64) as baseline_success_stddev_ct
+            , cast(avg(dva.daily_success_avs_fail_ct) as int64) as baseline_success_avs_fail_avg_ct
+            , cast(stddev_samp(dva.daily_success_avs_fail_ct) as int64) as baseline_success_avs_fail_stddev_ct
+            , cast(avg(dva.daily_decline_ct) as int64) as baseline_decline_avg_ct
+            , cast(stddev_samp(dva.daily_decline_ct) as int64) as baseline_decline_stddev_ct
         from baseline_dates bd
         join daily_volume_all dva
             on bd.baseline_dt = dva.trans_dt
@@ -115,10 +123,14 @@ with txn as
             , cc_first_6_nbr
             , daily_ct
             , daily_success_ct
+            , daily_success_avs_fail_ct
+            , daily_decline_ct
             , success_acct_ex1
             , success_acct_ex2
             , decline_acct_ex1
             , decline_acct_ex2
+            , success_avs_fail_ex1
+            , success_avs_fail_ex2
         from daily_volume_all
         where 1=1
             and trans_dt between run_range_start and run_range_end
@@ -152,10 +164,35 @@ with txn as
                 when (dv.daily_ct - bl.baseline_avg_ct) / nullif(bl.baseline_stddev_ct, 0) <= -z_threshold then 'large_decrease'
                 else null
             end as chg_flag
+
+            , bl.baseline_success_avs_fail_avg_ct
+            , bl.baseline_success_avs_fail_stddev_ct
+            , dv.daily_success_avs_fail_ct
+            , cast((dv.daily_success_avs_fail_ct - bl.baseline_success_avs_fail_avg_ct) as integer) as success_avs_fail_diff
+            , round((dv.daily_success_avs_fail_ct - bl.baseline_success_avs_fail_avg_ct) / nullif(bl.baseline_success_avs_fail_stddev_ct, 0), 2) as success_avs_fail_z_score
+            , case
+                when (dv.daily_success_avs_fail_ct - bl.baseline_success_avs_fail_avg_ct) / nullif(bl.baseline_success_avs_fail_stddev_ct, 0) >= z_threshold then 'large_increase'
+                when (dv.daily_success_avs_fail_ct - bl.baseline_success_avs_fail_avg_ct) / nullif(bl.baseline_success_avs_fail_stddev_ct, 0) <= -z_threshold then 'large_decrease'
+                else null
+            end as success_avs_fail_chg_flag
+
+            , bl.baseline_decline_avg_ct
+            , bl.baseline_decline_stddev_ct
+            , dv.daily_decline_ct
+            , cast((dv.daily_decline_ct - bl.baseline_decline_avg_ct) as integer) as decline_diff
+            , round((dv.daily_decline_ct - bl.baseline_decline_avg_ct) / nullif(bl.baseline_decline_stddev_ct, 0), 2) as decline_z_score
+            , case
+                when (dv.daily_decline_ct - bl.baseline_decline_avg_ct) / nullif(bl.baseline_decline_stddev_ct, 0) >= z_threshold then 'large_increase'
+                when (dv.daily_decline_ct - bl.baseline_decline_avg_ct) / nullif(bl.baseline_decline_stddev_ct, 0) <= -z_threshold then 'large_decrease'
+                else null
+            end as decline_chg_flag
+
             , success_acct_ex1
             , success_acct_ex2
             , decline_acct_ex1
             , decline_acct_ex2
+            , success_avs_fail_ex1
+            , success_avs_fail_ex2
 
         from daily_volume dv
         join dow_baseline bl
@@ -164,15 +201,43 @@ with txn as
             and dv.cc_first_6_nbr = bl.cc_first_6_nbr
         where 1=1
     )
+, bin_attack_bins as
+    (
+        select
+            *
+        from chg_chk
+        where 1=1
+            and baseline_avg_ct >= 300
+            and
+                (
+                    chg_flag is not null
+                    or
+                    success_chg_flag is not null
+                    or
+                    success_avs_fail_chg_flag is not null
+                    or
+                    decline_chg_flag is not null
+                )
+        order by 1, 2 desc, 3
+    )
+, bin_attackers as
+    (
+        select
+            bab.src_system_id
+            , bab.trans_dt
+            , bab.cc_first_6_nbr
+            , txn.account_cd
+            -- , txn.
+        from bin_attack_bins bab
+        join txn
+            on txn.src_system_id = bab.src_system_id
+            and txn.trans_dt = bab.trans_dt
+            and txn.cc_first_6_nbr = bab.cc_first_6_nbr
+        where 1=1
+        
+    )
 select
-    *
-from chg_chk
+*
+from bin_attack_bins
 where 1=1
-    and baseline_avg_ct >= 500
-    and
-        (
-            chg_flag is not null
-            or
-            success_chg_flag is not null
-        )
-order by 1, 2 desc, 3
+order by 1,2 desc, baseline_avg_ct desc
