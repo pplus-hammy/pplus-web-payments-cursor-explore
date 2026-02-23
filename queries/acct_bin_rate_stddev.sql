@@ -87,7 +87,7 @@ with txn as
             , t.cc_first_6_nbr
             , count(distinct t.account_cd) as daily_bin_ct
             , dt.daily_total_ct
-            , round(100.0 * count(distinct t.account_cd) / nullif(dt.daily_total_ct, 0), 5) as daily_rate_pct
+            , round(count(distinct t.account_cd) / nullif(dt.daily_total_ct, 0), 5) as daily_rate_pct
         from txn t
         join daily_totals dt
             on t.src_system_id = dt.src_system_id
