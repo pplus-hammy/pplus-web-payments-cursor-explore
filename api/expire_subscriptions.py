@@ -4,7 +4,13 @@ Recurly subscription cleanup: expire subscriptions, add account notes,
 clear billing info, and optionally refund invoices per CSV input.
 
 Target: https://cbscom-sand.recurly.com/
-API key must be for cbscom-sand.recurly.com (set via RECURLY_PRIVATE_API_KEY or below).
+API key: read from RECURLY_KEY_FILE or RECURLY_PRIVATE_API_KEY env.
+Subscription list: CSV at DEFAULT_INPUT_CSV (expire_refund_script_test.csv) unless --input is set.
+
+Authentication: Recurly expects the API key to be passed as the username in a
+Basic Authorization header (password empty). The official recurly-client-python
+library handles this when you pass the raw API key to recurly.Client(api_key).
+Do not pre-encode the key; the client sends it as Basic base64(api_key + ":").
 """
 
 from __future__ import annotations
@@ -13,12 +19,35 @@ import argparse
 import csv
 import os
 import sys
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-# Placeholder: set RECURLY_PRIVATE_API_KEY in env, or replace with your API key for cbscom-sand.recurly.com
-RECURLY_API_KEY = os.environ.get("RECURLY_PRIVATE_API_KEY", "YOUR_API_KEY")
+RECURLY_KEY_FILE = "/Users/gregory.hamilton/Desktop/Creds/recurly_us_sbx.txt"
+DEFAULT_INPUT_CSV = "/Users/gregory.hamilton/Downloads/expire_refund_script_test.csv"
+DEFAULT_LOG_DIR = "/Users/gregory.hamilton/Downloads"
+
+
+def _default_log_path() -> str:
+    """Default log path: expire_refund_script_log_yyyymmdd_hhmmss.csv in DEFAULT_LOG_DIR."""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return str(Path(DEFAULT_LOG_DIR) / f"expire_refund_script_log_{ts}.csv")
+
+
+def _load_api_key() -> str:
+    """
+    Load API key from RECURLY_KEY_FILE, then RECURLY_PRIVATE_API_KEY env.
+    Raw key only; Recurly client sends it as Basic auth username.
+    """
+    path = Path(RECURLY_KEY_FILE)
+    if path.exists():
+        key = path.read_text(encoding="utf-8").strip()
+        if key:
+            return key
+    return os.environ.get("RECURLY_PRIVATE_API_KEY", "YOUR_API_KEY")
+
+
+RECURLY_API_KEY = _load_api_key()
 
 try:
     import recurly
@@ -26,16 +55,32 @@ except ImportError:
     recurly = None
 
 
+def _refund_invoice_body() -> Dict[str, Any]:
+    """
+    Build request body for refund_invoice (full refund).
+    Per Recurly API v2021-02-25: use type "percentage" with percentage 100 for a full refund.
+    https://recurly.com/developers/api/v2021-02-25/index.html#operation/refund_invoice
+    """
+    return {"type": "percentage", "percentage": 100}
+
+
 def load_input(csv_path: Union[str, Path]) -> List[Dict[str, Any]]:
     """Load CSV with columns account_cd, subscription_guid, refund_dt, account_note (optional: currency_cd)."""
     path = Path(csv_path)
     if not path.exists():
         raise FileNotFoundError(f"Input CSV not found: {path}")
-    with open(path, newline="", encoding="utf-8") as f:
+    # utf-8-sig strips BOM (e.g. from Excel) so first column is "account_cd" not "\ufeffaccount_cd"
+    with open(path, newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         rows = list(reader)
     if not rows:
         return []
+    # Normalize header keys: strip BOM and whitespace so columns are found
+    for row in rows:
+        for k in list(row.keys()):
+            clean_key = k.strip().lstrip("\ufeff")
+            if clean_key != k:
+                row[clean_key] = row.pop(k)
     for col in ("account_cd", "subscription_guid", "refund_dt", "account_note"):
         if col not in rows[0]:
             raise ValueError(f"CSV must have column: {col}")
@@ -67,6 +112,67 @@ def _account_id(account_cd: str) -> str:
     return value if value.startswith("code-") else f"code-{value}"
 
 
+def _parse_refund_date(s: Optional[str]) -> Optional[date]:
+    """
+    Parse refund date from m/d/yyyy or yyyy-mm-dd. Returns date or None if invalid.
+    """
+    if not s or not (s := s.strip()):
+        return None
+    # yyyy-mm-dd (e.g. 2026-01-01)
+    if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+        try:
+            return datetime.strptime(s[:10], "%Y-%m-%d").date()
+        except ValueError:
+            pass
+    # mm/dd/yyyy (e.g. 01/01/2026)
+    try:
+        return datetime.strptime(s, "%m/%d/%Y").date()
+    except ValueError:
+        pass
+    # m/d/yyyy or m/d/yy (e.g. 1/1/2026, 1/1/26) via manual parse
+    parts = s.replace(",", "").split("/")
+    if len(parts) == 3:
+        try:
+            m, d, y = int(parts[0].strip()), int(parts[1].strip()), int(parts[2].strip())
+            if y < 100:
+                y += 2000 if y < 50 else 1900
+            return date(y, m, d)
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
+def _account_has_note_today(client: Any, acc_id: str, run_date: date) -> bool:
+    """Return True if the account already has at least one note created on run_date."""
+    try:
+        pager = client.list_account_notes(acc_id)
+        for note in pager.items():
+            created = getattr(note, "created_at", None)
+            if not created:
+                continue
+            note_date = created.date() if hasattr(created, "date") else datetime.fromisoformat(str(created).replace("Z", "+00:00")).date()
+            if note_date == run_date:
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _invoice_date(inv: Any) -> Optional[date]:
+    """Get invoice date from billed_at, closed_at, updated_at, or created_at (for comparison/sort)."""
+    for attr in ("billed_at", "closed_at", "updated_at", "created_at"):
+        val = getattr(inv, attr, None)
+        if not val:
+            continue
+        if hasattr(val, "date"):
+            return val.date()
+        try:
+            return datetime.fromisoformat(str(val).replace("Z", "+00:00")).date()
+        except Exception:
+            continue
+    return None
+
+
 def get_eligible_invoices(
     client: Any,
     subscription_id: str,
@@ -74,14 +180,14 @@ def get_eligible_invoices(
     currency_cd: str = "USD",
 ) -> List[Any]:
     """
-    List subscription invoices, filter to charge + total > 0 + currency + billed_at >= refund_dt,
-    sort by billed_at ascending. Return list of invoice objects.
+    List subscription invoices, filter to charge + total > 0 + currency + invoice_date >= refund_dt,
+    sort by invoice date ascending. Return list of invoice objects.
     """
-    if not refund_dt_str or not (refund_dt_str := refund_dt_str.strip()):
+    refund_dt_str = (refund_dt_str or "").strip()
+    if not refund_dt_str:
         return []
-    try:
-        refund_date = datetime.strptime(refund_dt_str.strip()[:10], "%Y-%m-%d").date()
-    except ValueError:
+    refund_date = _parse_refund_date(refund_dt_str)
+    if refund_date is None:
         return []
     out = []
     try:
@@ -94,36 +200,41 @@ def get_eligible_invoices(
                 continue
             if (getattr(inv, "currency", None) or "").upper() != (currency_cd or "USD").upper():
                 continue
-            billed_at = getattr(inv, "billed_at", None) or getattr(inv, "created_at", None)
-            if not billed_at:
+            inv_date = _invoice_date(inv)
+            if inv_date is None:
                 continue
-            if hasattr(billed_at, "date"):
-                inv_date = billed_at.date()
-            else:
-                try:
-                    inv_date = datetime.fromisoformat(str(billed_at).replace("Z", "+00:00")).date()
-                except Exception:
-                    continue
             if inv_date < refund_date:
                 continue
             out.append(inv)
-    except Exception:
+    except Exception as e:
+        print(f"  Warning: list_subscription_invoices failed: {e}", file=sys.stderr)
         return []
-    out.sort(key=lambda inv: getattr(inv, "billed_at", None) or getattr(inv, "created_at", None) or "")
+    out.sort(key=lambda inv: _invoice_date(inv) or date.min)
     return out
 
 
 def process_row(
-    client: Any, row: Dict[str, Any], log_entry: Dict[str, Any], dry_run: bool = False
+    client: Any,
+    row: Dict[str, Any],
+    log_entry: Dict[str, Any],
+    dry_run: bool = False,
+    run_date: Optional[date] = None,
+    row_index: Optional[int] = None,
 ) -> None:
     """
     Run the 5-step workflow for one CSV row. Mutating API calls skipped when dry_run is True.
     """
+    if run_date is None:
+        run_date = datetime.now().date()
+
     account_cd = (row.get("account_cd") or "").strip()
     subscription_guid = (row.get("subscription_guid") or "").strip()
     refund_dt = (row.get("refund_dt") or "").strip()
     account_note = (row.get("account_note") or "").strip()
     currency_cd = (row.get("currency_cd") or "USD").strip() or "USD"
+
+    row_label = f"Row {row_index}" if row_index is not None else "Row"
+    print(f"Processing {row_label}: account_cd={account_cd!r}, subscription_guid={subscription_guid!r}, refund_dt={refund_dt!r}")
 
     log_entry["account_cd"] = account_cd
     log_entry["subscription_guid"] = subscription_guid
@@ -140,35 +251,29 @@ def process_row(
         log_entry["error"] = "missing account_cd or subscription_guid"
         return
 
-    # Step 1: eligible invoices (only when refund_dt is set)
-    eligible = get_eligible_invoices(client, sub_id, refund_dt or None, currency_cd)
+    # Step 1: eligible invoices (when refund_dt is set and parseable)
+    eligible = get_eligible_invoices(client, sub_id, refund_dt if refund_dt else None, currency_cd)
+    parsed = _parse_refund_date(refund_dt) if refund_dt else None
+    print(f"  refund_dt={refund_dt!r} -> parsed={parsed}, eligible_invoices={len(eligible)}")
+    if refund_dt and parsed is None:
+        print(f"  Warning: refund_dt could not be parsed (use m/d/yyyy or yyyy-mm-dd); no refunds will be attempted for this row.")
     refunded_numbers = []
 
-    # Step 2: terminate subscription
+    # Step 2: terminate subscription (no refund; all refunds handled in step 5)
     try:
         if dry_run:
-            if len(eligible) == 1:
-                log_entry["subscription_state"] = "(dry-run) would terminate with refund=full"
-                refunded_numbers.append(getattr(eligible[0], "number", None) or getattr(eligible[0], "id", ""))
-            elif len(eligible) >= 2:
-                log_entry["subscription_state"] = "(dry-run) would terminate with refund=none"
-            else:
-                log_entry["subscription_state"] = "(dry-run) would terminate with refund=none"
+            log_entry["subscription_state"] = "(dry-run) would terminate with refund=none"
         else:
-            if len(eligible) == 1:
-                client.terminate_subscription(sub_id, params={"refund": "full"})
-                refunded_numbers.append(getattr(eligible[0], "number", None) or getattr(eligible[0], "id", ""))
-                log_entry["subscription_state"] = "expired"
-            else:
-                client.terminate_subscription(sub_id, params={"refund": "none"})
-                log_entry["subscription_state"] = "expired"
+            client.terminate_subscription(sub_id, params={"refund": "none"})
+            log_entry["subscription_state"] = "expired"
     except Exception as e:
         err = str(e)
         if "expired" in err.lower() or "canceled" in err.lower() or "not found" in err.lower():
             log_entry["subscription_state"] = "expired_or_invalid"
+            # Continue: still try note, billing clear, and refunds if needed
         else:
             log_entry["error"] = err
-            return
+            # Continue anyway so we can try refunds if eligible
 
     if not dry_run and not log_entry["subscription_state"]:
         try:
@@ -177,10 +282,12 @@ def process_row(
         except Exception:
             log_entry["subscription_state"] = "unknown"
 
-    # Step 3: add account note
+    # Step 3: add account note (skip if account already has a note added today)
     if account_note:
         if dry_run:
             log_entry["note_added"] = True  # would add
+        elif _account_has_note_today(client, acc_id, run_date):
+            log_entry["note_added"] = False  # already added today, skip
         else:
             try:
                 client.create_account_note(acc_id, {"message": account_note})
@@ -188,7 +295,7 @@ def process_row(
             except Exception as e:
                 log_entry["error"] = log_entry["error"] or str(e)
 
-    # Step 4: clear billing info
+    # Step 4: clear billing info (non-fatal if already cleared)
     if dry_run:
         log_entry["billing_cleared"] = True  # would clear
     else:
@@ -197,27 +304,39 @@ def process_row(
             log_entry["billing_cleared"] = True
         except Exception as e:
             if "404" in str(e) or "not found" in str(e).lower():
-                log_entry["billing_cleared"] = False  # none to remove
+                log_entry["billing_cleared"] = False  # already cleared, continue
             else:
-                log_entry["error"] = log_entry["error"] or str(e)
+                log_entry["error"] = (log_entry["error"] or str(e)) + " (billing)"
+            # Continue to step 5 (refunds) even if billing clear failed
 
-    # Step 5: refund 2+ eligible invoices (we already have the list)
-    if len(eligible) >= 2 and not dry_run:
-        for inv in eligible:
-            inv_number = getattr(inv, "number", None)
-            inv_id = getattr(inv, "id", None)
-            api_id = f"number-{inv_number}" if inv_number is not None else (inv_id or "")
-            if not api_id:
-                continue
-            try:
-                client.refund_invoice(api_id, {"type": "full"})
-                refunded_numbers.append(inv_number or inv_id)
-            except Exception:
-                pass
-    elif len(eligible) >= 2 and dry_run:
-        refunded_numbers.extend(
-            getattr(inv, "number", None) or getattr(inv, "id", "") for inv in eligible
-        )
+    # Step 5: refund all eligible invoices (1 or more)
+    if eligible:
+        eligible_display = [
+            getattr(inv, "number", None) or getattr(inv, "id", None) or "?"
+            for inv in eligible
+        ]
+        print(f"  Eligible invoice numbers: {eligible_display}")
+        if dry_run:
+            refunded_numbers.extend(
+                getattr(inv, "number", None) or getattr(inv, "id", "") for inv in eligible
+            )
+            print(f"  (dry-run) Would refund {len(eligible)} invoice(s)")
+        else:
+            for inv in eligible:
+                inv_number = getattr(inv, "number", None)
+                inv_id = getattr(inv, "id", None)
+                api_id = f"number-{inv_number}" if inv_number is not None else (inv_id or "")
+                if not api_id:
+                    print(f"  Skipping invoice (no number or id): {inv}", file=sys.stderr)
+                    continue
+                try:
+                    # Recurly API expects body with "type"; use request class if available for correct serialization
+                    refund_body = _refund_invoice_body()
+                    client.refund_invoice(api_id, refund_body)
+                    refunded_numbers.append(inv_number or inv_id)
+                    print(f"  Refunded invoice: {api_id}")
+                except Exception as e:
+                    print(f"  Refund failed for invoice {api_id}: {e}", file=sys.stderr)
 
     log_entry["refunded_invoice_numbers"] = refunded_numbers
 
@@ -252,23 +371,29 @@ def main() -> int:
     )
     parser.add_argument(
         "--input", "-i",
-        default="/Users/gregory.hamilton/Downloads/expire_refund_script_test.csv",
+        default=DEFAULT_INPUT_CSV,
         help="Input CSV path (account_cd, subscription_guid, refund_dt, account_note[, currency_cd])",
     )
     parser.add_argument(
         "--log", "-l",
-        default="/Users/gregory.hamilton/Downloads/expire_refund_script_log.csv",
-        help="Output log CSV path",
+        default=None,
+        help="Output log CSV path (default: expire_refund_script_log_yyyymmdd_hhmmss.csv in Downloads)",
     )
     parser.add_argument("--dry-run", "-n", action="store_true", help="Do not call mutating APIs; only log what would be done")
     args = parser.parse_args()
+
+    if args.log is None:
+        args.log = _default_log_path()
 
     if recurly is None:
         print("recurly package not installed. pip install recurly~=4.40", file=sys.stderr)
         return 1
 
-    if RECURLY_API_KEY == "YOUR_API_KEY":
-        print("Set RECURLY_PRIVATE_API_KEY or edit RECURLY_API_KEY in script (for cbscom-sand.recurly.com).", file=sys.stderr)
+    if RECURLY_API_KEY == "YOUR_API_KEY" or not RECURLY_API_KEY:
+        print(
+            f"Recurly API key not found. Add key to {RECURLY_KEY_FILE} or set RECURLY_PRIVATE_API_KEY (cbscom-sand.recurly.com).",
+            file=sys.stderr,
+        )
         return 1
 
     try:
@@ -279,11 +404,19 @@ def main() -> int:
 
     client = recurly.Client(RECURLY_API_KEY)
     log_entries = []
+    run_date = datetime.now().date()
 
     for i, row in enumerate(rows):
         log_entry = {}
         try:
-            process_row(client, row, log_entry, dry_run=args.dry_run)
+            process_row(
+                client,
+                row,
+                log_entry,
+                dry_run=args.dry_run,
+                run_date=run_date,
+                row_index=i + 1,
+            )
         except Exception as e:
             log_entry["account_cd"] = row.get("account_cd", "")
             log_entry["subscription_guid"] = row.get("subscription_guid", "")

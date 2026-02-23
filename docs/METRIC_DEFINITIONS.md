@@ -19,11 +19,9 @@ Definitions for the Payments & Fraud Monitoring Dashboard. Data source: `i-dss-s
 
 | Metric | Definition | Source / Notes |
 |--------|------------|----------------|
-| **Fraud decision share** | Percentage of transactions in each `fraud_decision_desc` value (e.g. allow, block, review). | `recurly_transaction_fct.fraud_decision_desc`. |
-| **Fraud score share** | Distribution of transactions by `fraud_score_cd` (risk tier). | `recurly_transaction_fct.fraud_score_cd`. |
 | **AVS result rate** | For successful/void transactions, share with AVS pass (Y/X/V) vs other. | `avs_result_cd`: typical pass = 'Y', 'X', 'V'; others = fail or no match. |
 | **CVV result rate** | For successful/void transactions, share with CVV match vs no match. | `recurly_transaction_fct.cvv_result_desc`. |
-| **Dispute rate** | (Optional) Disputes or chargebacks as % of volume/count. | Add if data exists in payment_ops_vw or linked dataset. |
+| **Dispute rate** | (Optional) Disputes or chargebacks as % of volume/count. | chargeback_disputes_global.sql as a reference for dispute data |
 
 ---
 
