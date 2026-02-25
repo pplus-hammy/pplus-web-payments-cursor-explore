@@ -255,7 +255,6 @@ with sub as
             and txn.trans_dt >= date('2025-01-01')
             and txn.trans_type_desc in ('purchase', 'verify')
             and txn.trans_status_desc in ('success', 'void', 'declined')
-            and txn.origin_desc in ('api', 'token_api', 'api_sub_change')
     )
 
 , txn_adj as
@@ -276,6 +275,10 @@ with sub as
         where 1=1
     )
 
+-- txn_with_sub_win: join each transaction to the subscription whose activation window contains the txn.
+-- Match is by (src_system_id, account_cd) and trans_dt_ut in [prior_expiration, activate_dt_ut).
+-- Used to categorize verifications (no subscription_guid/invoice_guid) and non-renewal declined purchases
+-- that fall in that window. QUALIFY keeps one sub per txn when multiple windows could match.
 , txn_with_sub_win as
     (
         select
@@ -290,12 +293,16 @@ with sub as
         left join sub_categorized sub_win
             on sub_win.src_system_id = txn_adj.src_system_id
             and sub_win.account_cd = txn_adj.account_cd
-            and txn_adj.trans_dt_ut >= coalesce(sub_win.prior_expiration, timestamp('1900-01-01 00:00:01 UTC'))
-            and txn_adj.trans_dt_ut < coalesce(sub_win.activate_dt_ut, timestamp('2999-12-31 23:59:59 UTC'))
+            and txn_adj.trans_dt_ut between coalesce(sub_win.prior_expiration, timestamp('1900-01-01 00:00:01 UTC')) and coalesce(sub_win.post_activate, timestamp('2999-12-31 23:59:59 UTC'))
+            -- and txn_adj.trans_dt_ut >= coalesce(sub_win.prior_expiration, timestamp('1900-01-01 00:00:01 UTC'))
+            -- and txn_adj.trans_dt_ut < coalesce(sub_win.activate_dt_ut, timestamp('2999-12-31 23:59:59 UTC'))
         where 1=1
         qualify row_number() over (partition by txn_adj.transaction_guid order by sub_win.activate_dt_ut) = 1
     )
 
+-- txn_with_subs: join each transaction to the subscription by subscription_guid (when present).
+-- Supplies trial/activation timestamps (e.g. sub_sub_trial_end_dt_ut, sub_sub_pre_activate) used
+-- to categorize trial_to_paid, direct_to_paid, and recurring transactions linked to an invoice.
 , txn_with_subs as
     (
         select
@@ -335,7 +342,7 @@ with sub as
                     then 'trial_verify'
                 when txn_with_subs.trans_type_desc = 'purchase'
                     and txn_with_subs.invoice_type_cd = 'renewal'
-                    and coalesce(txn_with_subs.adj_total_amt, 0) > 0
+                    -- and coalesce(txn_with_subs.adj_total_amt, 0) > 0
                     and txn_with_subs.sub_sub_trial_end_dt_ut is not null
                     and txn_with_subs.invoice_billed_dt_ut between txn_with_subs.sub_sub_pre_trial_end and txn_with_subs.sub_sub_post_trial_end
                     and txn_with_subs.renewal_earliest_inv = 1
@@ -373,46 +380,91 @@ with sub as
         where 1=1
     )
 
+-- Top 100 card bins by transaction volume for the filtered period; used to restrict all downstream aggregations.
+, top_100_bins as
+    (
+        select
+            cc_first_6_nbr
+        from
+            (
+                select
+                    txn.cc_first_6_nbr
+                    , count(*) as txn_cnt
+                from txn
+                where 1=1
+                    and txn.cc_first_6_nbr is not null
+                group by txn.cc_first_6_nbr
+                order by txn_cnt desc
+                limit 100
+            ) r
+        where 1=1
+    )
+
+-- Base for aggregation: one row per transaction with a consistent invoice identifier.
+-- Real invoices: invoice_grouper = invoice_guid. Verifications and non-renewal declines (no invoice):
+-- invoice_grouper = derived key from (src_system_id, account_cd, sub_win_prior_expiration, sub_win_activate_dt_ut).
+-- invoice_dt_ut is used for invoice-level timeframe (day/week/month/quarter); for real invoices = invoice_billed_dt_ut, else trans_dt_ut.
+, txn_invoice_base as
+    (
+        select
+            txn_categorized.*
+            , coalesce(
+                nullif(trim(txn_categorized.invoice_guid), ''),
+                format('window_%s_%s_%s_%s'
+                    , cast(txn_categorized.src_system_id as string)
+                    , txn_categorized.account_cd
+                    , cast(coalesce(txn_categorized.sub_win_prior_expiration, timestamp('1900-01-01 00:00:01 UTC')) as string)
+                    , cast(coalesce(txn_categorized.sub_win_activate_dt_ut, timestamp('2999-12-31 23:59:59 UTC')) as string)
+                )
+            ) as invoice_grouper
+            , coalesce(txn_categorized.invoice_billed_dt_ut, txn_categorized.trans_dt_ut) as invoice_dt_ut
+        from txn_categorized
+        where 1=1
+            and txn_categorized.cc_first_6_nbr in (select cc_first_6_nbr from top_100_bins)
+    )
+
 , invoice_success as
     (
         select
-            txn_categorized.src_system_id
-            , txn_categorized.account_cd
-            , txn_categorized.invoice_guid
-            , max(case when txn_categorized.trans_type_desc = 'purchase' and txn_categorized.trans_status_desc in ('success', 'void') then 1 else 0 end) as has_success_purchase
-        from txn_categorized
+            txn_invoice_base.src_system_id
+            , txn_invoice_base.account_cd
+            , txn_invoice_base.invoice_grouper
+            , max(case
+                when txn_invoice_base.trans_type_desc = 'purchase' and txn_invoice_base.trans_status_desc in ('success', 'void') then 1
+                when txn_invoice_base.trans_type_desc = 'verify' and txn_invoice_base.trans_status_desc in ('success', 'void') then 1
+                else 0
+            end) as has_success_purchase
+        from txn_invoice_base
         where 1=1
-            and txn_categorized.invoice_guid is not null
         group by
-            txn_categorized.src_system_id
-            , txn_categorized.account_cd
-            , txn_categorized.invoice_guid
+            txn_invoice_base.src_system_id
+            , txn_invoice_base.account_cd
+            , txn_invoice_base.invoice_grouper
     )
 
 , verify_window_agg as
     (
         select
-            txn_categorized.src_system_id
-            , txn_categorized.account_cd
-            , txn_categorized.sub_win_prior_expiration as window_prior_expiration
-            , txn_categorized.sub_win_activate_dt_ut as window_activate_dt_ut
-            , min(txn_categorized.trans_dt) as window_trans_dt
-            , txn_categorized.trans_gateway_type_desc
-            , txn_categorized.cc_first_6_nbr
-            , txn_categorized.transaction_category
+            txn_invoice_base.src_system_id
+            , txn_invoice_base.account_cd
+            , txn_invoice_base.invoice_grouper
+            , min(txn_invoice_base.trans_dt) as window_trans_dt
+            , txn_invoice_base.trans_gateway_type_desc
+            , txn_invoice_base.cc_first_6_nbr
+            , txn_invoice_base.transaction_category
             , count(*) as attempt_cnt
-            , countif(txn_categorized.trans_status_desc in ('success', 'void')) as success_cnt
-        from txn_categorized
+            , countif(txn_invoice_base.trans_status_desc in ('success', 'void')) as success_cnt
+        from txn_invoice_base
         where 1=1
-            and txn_categorized.transaction_category in ('trial_verify', 'other_verify')
+            and txn_invoice_base.transaction_category in ('trial_verify', 'other_verify')
+            and txn_invoice_base.invoice_grouper like 'window_%'
         group by
-            txn_categorized.src_system_id
-            , txn_categorized.account_cd
-            , txn_categorized.sub_win_prior_expiration
-            , txn_categorized.sub_win_activate_dt_ut
-            , txn_categorized.trans_gateway_type_desc
-            , txn_categorized.cc_first_6_nbr
-            , txn_categorized.transaction_category
+            txn_invoice_base.src_system_id
+            , txn_invoice_base.account_cd
+            , txn_invoice_base.invoice_grouper
+            , txn_invoice_base.trans_gateway_type_desc
+            , txn_invoice_base.cc_first_6_nbr
+            , txn_invoice_base.transaction_category
     )
 
 , inv_agg as
@@ -423,18 +475,18 @@ with sub as
             , adj.invoice_guid
             , adj.invoice_billed_dt_ut
             , adj.invoice_category
-            , txn_categorized.trans_gateway_type_desc
-            , txn_categorized.cc_first_6_nbr
+            , txn_invoice_base.trans_gateway_type_desc
+            , txn_invoice_base.cc_first_6_nbr
             , max(invoice_success.has_success_purchase) as is_success_invoice
         from adj_categorized_final adj
-        inner join txn_categorized
-            on txn_categorized.src_system_id = adj.src_system_id
-            and txn_categorized.account_cd = adj.account_cd
-            and txn_categorized.invoice_guid = adj.invoice_guid
+        inner join txn_invoice_base
+            on txn_invoice_base.src_system_id = adj.src_system_id
+            and txn_invoice_base.account_cd = adj.account_cd
+            and txn_invoice_base.invoice_guid = adj.invoice_guid
         left join invoice_success
-            on invoice_success.src_system_id = adj.src_system_id
-            and invoice_success.account_cd = adj.account_cd
-            and invoice_success.invoice_guid = adj.invoice_guid
+            on invoice_success.src_system_id = txn_invoice_base.src_system_id
+            and invoice_success.account_cd = txn_invoice_base.account_cd
+            and invoice_success.invoice_grouper = txn_invoice_base.invoice_grouper
         where 1=1
         group by
             adj.src_system_id
@@ -442,33 +494,33 @@ with sub as
             , adj.invoice_guid
             , adj.invoice_billed_dt_ut
             , adj.invoice_category
-            , txn_categorized.trans_gateway_type_desc
-            , txn_categorized.cc_first_6_nbr
+            , txn_invoice_base.trans_gateway_type_desc
+            , txn_invoice_base.cc_first_6_nbr
     )
 
 -- Transaction-level aggregation: by gateway, timeframe (day/week/month/quarter), optional card bin
 , txn_metrics as
     (
         select
-            txn_categorized.trans_gateway_type_desc
-            , date(txn_categorized.trans_dt) as trans_dt_day
-            , date_trunc(txn_categorized.trans_dt, week(monday)) as trans_dt_week
-            , date_trunc(txn_categorized.trans_dt, month) as trans_dt_month
-            , date_trunc(txn_categorized.trans_dt, quarter) as trans_dt_quarter
-            , txn_categorized.cc_first_6_nbr
-            , txn_categorized.transaction_category
+            txn_invoice_base.trans_gateway_type_desc
+            , date(txn_invoice_base.trans_dt) as trans_dt_day
+            , date_trunc(txn_invoice_base.trans_dt, week) as trans_dt_week
+            , date_trunc(txn_invoice_base.trans_dt, month) as trans_dt_month
+            , date_trunc(txn_invoice_base.trans_dt, quarter) as trans_dt_quarter
+            , txn_invoice_base.cc_first_6_nbr
+            , txn_invoice_base.transaction_category
             , count(*) as total_transactions
-            , countif(txn_categorized.trans_status_desc in ('success', 'void')) as successful_transactions
-        from txn_categorized
+            , countif(txn_invoice_base.trans_status_desc in ('success', 'void')) as successful_transactions
+        from txn_invoice_base
         where 1=1
         group by
-            txn_categorized.trans_gateway_type_desc
-            , date(txn_categorized.trans_dt)
-            , date_trunc(txn_categorized.trans_dt, week(monday))
-            , date_trunc(txn_categorized.trans_dt, month)
-            , date_trunc(txn_categorized.trans_dt, quarter)
-            , txn_categorized.cc_first_6_nbr
-            , txn_categorized.transaction_category
+            txn_invoice_base.trans_gateway_type_desc
+            , date(txn_invoice_base.trans_dt)
+            , date_trunc(txn_invoice_base.trans_dt, week)
+            , date_trunc(txn_invoice_base.trans_dt, month)
+            , date_trunc(txn_invoice_base.trans_dt, quarter)
+            , txn_invoice_base.cc_first_6_nbr
+            , txn_invoice_base.transaction_category
     )
 
 -- Invoice-level aggregation: by gateway, timeframe (day/week/month/quarter), optional card bin (real invoices + verification windows)
@@ -477,9 +529,9 @@ with sub as
         select
             inv_agg.trans_gateway_type_desc
             , date(inv_agg.invoice_billed_dt_ut) as invoice_dt_day
-            , date_trunc(inv_agg.invoice_billed_dt_ut, week(monday)) as invoice_dt_week
-            , date_trunc(inv_agg.invoice_billed_dt_ut, month) as invoice_dt_month
-            , date_trunc(inv_agg.invoice_billed_dt_ut, quarter) as invoice_dt_quarter
+            , date_trunc(date(inv_agg.invoice_billed_dt_ut), week) as invoice_dt_week
+            , date_trunc(date(inv_agg.invoice_billed_dt_ut), month) as invoice_dt_month
+            , date_trunc(date(inv_agg.invoice_billed_dt_ut), quarter) as invoice_dt_quarter
             , inv_agg.cc_first_6_nbr
             , inv_agg.invoice_category
             , 1 as invoice_cnt
@@ -494,9 +546,9 @@ with sub as
         select
             verify_window_agg.trans_gateway_type_desc
             , date(verify_window_agg.window_trans_dt) as invoice_dt_day
-            , date_trunc(verify_window_agg.window_trans_dt, week(monday)) as invoice_dt_week
-            , date_trunc(verify_window_agg.window_trans_dt, month) as invoice_dt_month
-            , date_trunc(verify_window_agg.window_trans_dt, quarter) as invoice_dt_quarter
+            , date_trunc(date(verify_window_agg.window_trans_dt), week) as invoice_dt_week
+            , date_trunc(date(verify_window_agg.window_trans_dt), month) as invoice_dt_month
+            , date_trunc(date(verify_window_agg.window_trans_dt), quarter) as invoice_dt_quarter
             , verify_window_agg.cc_first_6_nbr
             , verify_window_agg.transaction_category as invoice_category
             , 1 as invoice_cnt
