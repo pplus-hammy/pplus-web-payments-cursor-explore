@@ -1,3 +1,8 @@
+declare run_range_end date default date_add(current_date(), interval -1 day);
+declare run_range_start date default date_add(run_range_end, interval -121 day);
+declare z_threshold float64 default 3;
+declare excluded_dts array<date> default [date('2026-01-24'),date('2026-01-25'),date('2026-01-31'), date('2026-02-01'),date('2999-12-31')]; -- days to exclude from baseline (like big event days)
+
 with txn as
     (
         select
@@ -46,10 +51,15 @@ with txn as
             , trans_msg_desc
             , reference_cd
         from i-dss-streaming-data.payment_ops_vw.recurly_transaction_fct txn
+        -- left join sub
+        --     on sub.src_system_id = txn.src_system_id
+        --     and sub.account_cd = txn.account_cd
+        --     -- and sub.subscription_guid = txn.subscription_guid
+        --     and txn.trans_dt_ut between date_add(coalesce(sub.trial_start_dt_ut, sub.activate_dt_ut), interval -15 MINUTE) and date_add(coalesce(sub.trial_end_dt_ut, sub.activate_dt_ut), interval 15 MINUTE)
         where 1=1
             -- and txn.src_system_id = 115
-            and txn.trans_dt >= date_add(current_date(), interval -4 month)
-            and txn.trans_dt <= current_date()
+            and txn.trans_dt >= date_add(run_range_start, interval -6 month)
+            and txn.trans_dt <= run_range_end
             and txn.trans_type_desc in ('purchase', 'verify')
             and txn.trans_status_desc in ('success', 'void', 'declined')
             and txn.origin_desc in ('api', 'token_api')
@@ -60,7 +70,7 @@ with txn as
 , run_dates as
     (
         select run_dt
-        from unnest(generate_date_array(date_add(current_date(), interval -4 month), current_date())) as run_dt
+        from unnest(generate_date_array(run_range_start, run_range_end)) as run_dt
     )
 
 , baseline_dates as
@@ -87,11 +97,16 @@ with txn as
             , count(distinct case when trans_status_desc = 'declined' then account_cd else null end) as daily_decline_ct
         from txn
         where 1=1
-            and trans_dt >= date_sub(date_add(current_date(), interval -4 month), interval 3 month)
-            and trans_dt <= current_date()
+            and trans_dt >= date_sub(run_range_start, interval 3 month)
+            and trans_dt <= run_range_end
             and trans_dt not in (date('2026-01-24'), date('2026-01-25')) --exclude big event days, which skew the deviations
         group by 1,2,3,4
     )
+
+-- select
+--     *
+-- from daily_volume_all
+-- order by 1,2,3 desc, 5 desc
 
 , dow_baseline as
     (
@@ -129,7 +144,7 @@ with txn as
             , daily_decline_ct
         from daily_volume_all
         where 1=1
-            and trans_dt between date_add(current_date(), interval -4 month) and current_date()
+            and trans_dt between run_range_start and run_range_end
     )
 
 , chg_chk as
@@ -145,44 +160,40 @@ with txn as
             , cast((dv.daily_success_ct - bl.baseline_success_avg_ct) as integer) as success_diff
             , round((dv.daily_success_ct - bl.baseline_success_avg_ct) / nullif(bl.baseline_success_stddev_ct, 0), 2) as success_z_score
             , case
-                when (dv.daily_success_ct - bl.baseline_success_avg_ct) / nullif(bl.baseline_success_stddev_ct, 0) >= <Parameters.Z-Score> then 'large_increase'
-                when (dv.daily_success_ct - bl.baseline_success_avg_ct) / nullif(bl.baseline_success_stddev_ct, 0) <= -<Parameters.Z-Score> then 'large_decrease'
+                when (dv.daily_success_ct - bl.baseline_success_avg_ct) / nullif(bl.baseline_success_stddev_ct, 0) >= z_threshold then 'large_increase'
+                when (dv.daily_success_ct - bl.baseline_success_avg_ct) / nullif(bl.baseline_success_stddev_ct, 0) <= -z_threshold then 'large_decrease'
                 else null
             end as success_chg_flag
-
             , bl.baseline_avg_ct
             , bl.baseline_stddev_ct
             , dv.daily_ct
             , cast((dv.daily_ct - bl.baseline_avg_ct) as integer) as vol_diff
             , round((dv.daily_ct - bl.baseline_avg_ct) / nullif(bl.baseline_stddev_ct, 0), 2) as vol_z_score
             , case
-                when (dv.daily_ct - bl.baseline_avg_ct) / nullif(bl.baseline_stddev_ct, 0) >= <Parameters.Z-Score> then 'large_increase'
-                when (dv.daily_ct - bl.baseline_avg_ct) / nullif(bl.baseline_stddev_ct, 0) <= -<Parameters.Z-Score> then 'large_decrease'
+                when (dv.daily_ct - bl.baseline_avg_ct) / nullif(bl.baseline_stddev_ct, 0) >= z_threshold then 'large_increase'
+                when (dv.daily_ct - bl.baseline_avg_ct) / nullif(bl.baseline_stddev_ct, 0) <= -z_threshold then 'large_decrease'
                 else null
             end as chg_flag
-
             , bl.baseline_success_avs_fail_avg_ct
             , bl.baseline_success_avs_fail_stddev_ct
             , dv.daily_success_avs_fail_ct
             , cast((dv.daily_success_avs_fail_ct - bl.baseline_success_avs_fail_avg_ct) as integer) as success_avs_fail_diff
             , round((dv.daily_success_avs_fail_ct - bl.baseline_success_avs_fail_avg_ct) / nullif(bl.baseline_success_avs_fail_stddev_ct, 0), 2) as success_avs_fail_z_score
             , case
-                when (dv.daily_success_avs_fail_ct - bl.baseline_success_avs_fail_avg_ct) / nullif(bl.baseline_success_avs_fail_stddev_ct, 0) >= <Parameters.Z-Score> then 'large_increase'
-                when (dv.daily_success_avs_fail_ct - bl.baseline_success_avs_fail_avg_ct) / nullif(bl.baseline_success_avs_fail_stddev_ct, 0) <= -<Parameters.Z-Score> then 'large_decrease'
+                when (dv.daily_success_avs_fail_ct - bl.baseline_success_avs_fail_avg_ct) / nullif(bl.baseline_success_avs_fail_stddev_ct, 0) >= z_threshold then 'large_increase'
+                when (dv.daily_success_avs_fail_ct - bl.baseline_success_avs_fail_avg_ct) / nullif(bl.baseline_success_avs_fail_stddev_ct, 0) <= -z_threshold then 'large_decrease'
                 else null
             end as success_avs_fail_chg_flag
-
             , bl.baseline_decline_avg_ct
             , bl.baseline_decline_stddev_ct
             , dv.daily_decline_ct
             , cast((dv.daily_decline_ct - bl.baseline_decline_avg_ct) as integer) as decline_diff
             , round((dv.daily_decline_ct - bl.baseline_decline_avg_ct) / nullif(bl.baseline_decline_stddev_ct, 0), 2) as decline_z_score
             , case
-                when (dv.daily_decline_ct - bl.baseline_decline_avg_ct) / nullif(bl.baseline_decline_stddev_ct, 0) >= <Parameters.Z-Score> then 'large_increase'
-                when (dv.daily_decline_ct - bl.baseline_decline_avg_ct) / nullif(bl.baseline_decline_stddev_ct, 0) <= -<Parameters.Z-Score> then 'large_decrease'
+                when (dv.daily_decline_ct - bl.baseline_decline_avg_ct) / nullif(bl.baseline_decline_stddev_ct, 0) >= z_threshold then 'large_increase'
+                when (dv.daily_decline_ct - bl.baseline_decline_avg_ct) / nullif(bl.baseline_decline_stddev_ct, 0) <= -z_threshold then 'large_decrease'
                 else null
             end as decline_chg_flag
-
         from daily_volume dv
         join dow_baseline bl
             on dv.src_system_id = bl.src_system_id

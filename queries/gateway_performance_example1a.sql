@@ -377,7 +377,7 @@ with sub as
 
 , txn_inv_sub as
     (
-        select
+        select distinct
             txn.*
             , sc.success_ind
             , sub.activate_dt_ut
@@ -749,9 +749,9 @@ with sub as
         select distinct
             tc.*
             , max(case when ifnull(trim(failure_type),'') = 'fraud_gateway' then 1 else 0 end) over (partition by src_system_id, account_cd, invoice_nbr) as fraud_chk
-            , lead(tc.invoice_nbr) over (partition by src_system_id, account_cd, sub_guid order by trans_dt_ut) as next_inv_nbr
-            , lead(tc.invoice_billed_dt_ut) over (partition by src_system_id, account_cd, sub_guid order by trans_dt_ut) as next_inv_dt
-            , lead(tc.txn_classify) over (partition by src_system_id, account_cd, sub_guid order by trans_dt_ut) as next_txn_classify
+            -- , lead(tc.invoice_nbr) over (partition by src_system_id, account_cd, sub_guid order by trans_dt_ut) as next_inv_nbr
+            -- , lead(tc.invoice_billed_dt_ut) over (partition by src_system_id, account_cd, sub_guid order by trans_dt_ut) as next_inv_dt
+            -- , lead(tc.txn_classify) over (partition by src_system_id, account_cd, sub_guid order by trans_dt_ut) as next_txn_classify
         from txn_classify tc
         where 1=1
         -- -- Adyen/Cybersource test
@@ -790,11 +790,10 @@ update aggregate field names to be generic & the metric level will indicate whic
     (
         select
             src_system_id
-            -- , date(coalesce(invoice_billed_dt_ut, trans_dt_ut)) as dt
-            , date_trunc(date(coalesce(invoice_billed_dt_ut, trans_dt_ut)), MONTH) as dt
-            -- , date(datetime(coalesce(invoice_billed_dt_ut, trans_dt_ut), 'America/Los_Angeles')) as dt
-            -- , extract(hour from datetime(coalesce(invoice_billed_dt_ut, trans_dt_ut), 'America/Los_Angeles')) as hr
-            -- , account_cd
+            , 'txn' as metric_level
+            -- , date(datetime(trans_dt_ut, 'America/Los_Angeles')) as dt
+            , date_trunc(date(datetime(trans_dt_ut, 'America/Los_Angeles')), MONTH) as dt
+
             , coalesce(overall_sub_start_type_desc, 'new_start') as overall_sub_start_type_desc
             , trans_gateway_type_desc
             , case
@@ -821,65 +820,80 @@ update aggregate field names to be generic & the metric level will indicate whic
             --     when trans_status_desc in ('success','void') then 'success'
             --     else trans_status_desc
             -- end as trans_status_desc
-            , count(distinct case when trans_status_desc in ('success','void') then transaction_guid else null end) as txn_success_ct
-            , count(distinct case when trans_status_desc = 'declined' then transaction_guid else null end) as txn_decline_ct
-            , count(distinct transaction_guid) as txn_tot_ct
-            , round(safe_divide(count(distinct case when trans_status_desc in ('success','void') then transaction_guid else null end), count(distinct transaction_guid)),5) as txn_success_rate
 
-            , count(distinct case when trans_status_desc in ('success','void') and ifnull(trim(failure_type),'') != 'fraud_gateway' then transaction_guid else null end) as no_fraud_txn_success_ct
-            , count(distinct case when trans_status_desc = 'declined' and ifnull(trim(failure_type),'') != 'fraud_gateway' then transaction_guid else null end) as no_fraud_txn_decline_ct
-            , count(distinct case when ifnull(trim(failure_type),'') != 'fraud_gateway' then transaction_guid else null end) as no_fraud_txn_tot_ct
-            , round(safe_divide(count(distinct case when trans_status_desc in ('success','void') and ifnull(trim(failure_type),'') != 'fraud_gateway' then transaction_guid else null end), count(distinct case when ifnull(trim(failure_type),'') != 'fraud_gateway' then transaction_guid else null end)),5) as no_fraud_txn_success_rate
+            , count(distinct case when trans_status_desc in ('success','void') then transaction_guid else null end) as success_ct
+            , count(distinct case when trans_status_desc = 'declined' then transaction_guid else null end) as decline_ct
+            , count(distinct transaction_guid) as tot_ct
+            , round(safe_divide(count(distinct case when trans_status_desc in ('success','void') then transaction_guid else null end), count(distinct transaction_guid)),5) as success_rate
 
-            -- , count(distinct case when invoice_state_desc = 'paid' then invoice_nbr else null end) as inv_success_ct
-            , count(distinct case when success_ind = 1 then invoice_nbr else null end) as inv_success_ct
-            -- , count(distinct case when (invoice_state_desc is not null and invoice_state_desc != 'paid') or (invoice_state_desc is null and trans_status_desc = 'declined') then invoice_nbr else null end) as inv_decline_ct
-            , count(distinct case when success_ind = 0 then invoice_nbr else null end) as inv_decline_ct
-            , count(distinct invoice_nbr) as inv_tot_ct
-            -- , round(safe_divide(count(distinct case when invoice_state_desc = 'paid' then invoice_nbr else null end), count(distinct invoice_nbr)),5) as inv_success_rate
-            , round(safe_divide(count(distinct case when success_ind = 1 then invoice_nbr else null end), count(distinct invoice_nbr)),5) as inv_success_rate
-
-            -- , count(distinct case when invoice_state_desc = 'paid' and fraud_chk = 0 then invoice_nbr else null end) as no_fraud_inv_success_ct
-            , count(distinct case when success_ind = 1 and fraud_chk = 0 then invoice_nbr else null end) as no_fraud_inv_success_ct
-            -- , count(distinct case when fraud_chk = 0 and ((invoice_state_desc is not null and invoice_state_desc != 'paid') or (invoice_state_desc is null and trans_status_desc = 'declined')) then invoice_nbr else null end) as no_fraud_inv_decline_ct
-            , count(distinct case when success_ind = 0 and fraud_chk = 0 then invoice_nbr else null end) as no_fraud_inv_decline_ct
-            , count(distinct case when fraud_chk = 0 then invoice_nbr else null end) as no_fraud_inv_tot_ct
-            -- , round(safe_divide(count(distinct case when invoice_state_desc = 'paid' and fraud_chk = 0 then invoice_nbr else null end), count(distinct case when fraud_chk = 0 then invoice_nbr else null end)),5) as no_fraud_inv_success_rate
-            , round(safe_divide(count(distinct case when success_ind = 1 and fraud_chk = 0 then invoice_nbr else null end), count(distinct case when fraud_chk = 0 then invoice_nbr else null end)),5) as no_fraud_inv_success_rate
+            , count(distinct case when trans_status_desc in ('success','void') and ifnull(trim(failure_type),'') != 'fraud_gateway' then transaction_guid else null end) as no_fraud_success_ct
+            , count(distinct case when trans_status_desc = 'declined' and ifnull(trim(failure_type),'') != 'fraud_gateway' then transaction_guid else null end) as no_fraud_decline_ct
+            , count(distinct case when ifnull(trim(failure_type),'') != 'fraud_gateway' then transaction_guid else null end) as no_fraud_tot_ct
+            , round(safe_divide(count(distinct case when trans_status_desc in ('success','void') and ifnull(trim(failure_type),'') != 'fraud_gateway' then transaction_guid else null end), count(distinct case when ifnull(trim(failure_type),'') != 'fraud_gateway' then transaction_guid else null end)),5) as no_fraud_success_rate
 
 
-            , min(case when trans_status_desc in ('success','void') then transaction_guid else null end) as txn_success_ex1
-            , max(case when trans_status_desc in ('success','void') then transaction_guid else null end) as txn_success_ex2
-            , min(case when trans_status_desc = 'declined' then transaction_guid else null end) as txn_decline_ex1
-            , max(case when trans_status_desc = 'declined' then transaction_guid else null end) as txn_decline_ex2
 
-            , min(case when trans_status_desc = 'declined' and ifnull(trim(failure_type),'') != 'fraud_gateway' then transaction_guid else null end) as no_fraud_txn_decline_ex1
-            , max(case when trans_status_desc = 'declined' and ifnull(trim(failure_type),'') != 'fraud_gateway' then transaction_guid else null end) as no_fraud_txn_decline_ex2
 
-            , min(case when invoice_state_desc = 'paid' then invoice_nbr else null end) as inv_success_ex1
-            , max(case when invoice_state_desc = 'paid' then invoice_nbr else null end) as inv_success_ex2
-            -- , min(case when (invoice_state_desc is not null and invoice_state_desc != 'paid') or (invoice_state_desc is null and trans_status_desc = 'declined') then invoice_nbr else null end) as inv_decline_ex1
-            -- , max(case when (invoice_state_desc is not null and invoice_state_desc != 'paid') or (invoice_state_desc is null and trans_status_desc = 'declined') then invoice_nbr else null end) as inv_decline_ex2
-            , min(case when success_ind = 0 then invoice_nbr else null end) as inv_decline_ex1
-            , max(case when success_ind = 0 then invoice_nbr else null end) as inv_decline_ex2
+            , min(case when trans_status_desc in ('success','void') then transaction_guid else null end) as success_ex1
+            , max(case when trans_status_desc in ('success','void') then transaction_guid else null end) as success_ex2
+
+            , min(case when trans_status_desc = 'declined' then transaction_guid else null end) as decline_ex1
+            , max(case when trans_status_desc = 'declined' then transaction_guid else null end) as decline_ex2
+
+            , min(case when trans_status_desc = 'declined' and ifnull(trim(failure_type),'') != 'fraud_gateway' then transaction_guid else null end) as no_fraud_decline_ex1
+            , max(case when trans_status_desc = 'declined' and ifnull(trim(failure_type),'') != 'fraud_gateway' then transaction_guid else null end) as no_fraud_decline_ex2
+
         from dtls 
-        -- join
-        --     (
-        --         select
-        --             src_system_id
-        --             , dt
-        --             , account_cd
-        --             , txn_classify
-        --             , row_number() over (partition by src_system_id, dt, account_cd order by txn_classify desc) as rn
-        --         from dtls
-        --         where 1=1
-        --     )
         where 1=1 
-            -- and txn_classify in ('auth_initial','auth_restart','purch_initial','purch_initial_trial_removed','purch_restart','purch_restart_trial_removed')
-            -- and txn_classify not like 'unclassified%'
-            -- and txn_classify not in ('auth_other','purch_auto-card-update')
         group by all
-        order by 1,2
+
+
+        union all
+
+        select
+            src_system_id
+            , 'invoice' as metric_level
+            -- , date(datetime(invoice_billed_dt_ut, 'America/Los_Angeles')) as dt
+            , date_trunc(date(datetime(invoice_billed_dt_ut, 'America/Los_Angeles')), MONTH) as dt
+
+            , coalesce(overall_sub_start_type_desc, 'new_start') as overall_sub_start_type_desc
+            , trans_gateway_type_desc
+            , case
+                -- when txn_classify like 'auth%' then 'trial_verify' -- all verify ties out with tableau dashboard
+                when txn_classify in ('auth_initial','auth_restart') then 'trial_verify'
+                -- when txn_classify like 'auth%' then 'verify_other' 
+                when txn_classify like 'purch_trial%' then 'trial_to_paid'
+                -- when txn_classify in ('purch_initial', 'purch_initial_trial_removed', 'purch_restart', 'purch_restart_trial_removed', 'purch_auto-card-update', 'purch_sub-change') then 'direct_to_paid' -- include sub change?
+                when txn_classify in ('purch_initial', 'purch_initial_trial_removed', 'purch_restart', 'purch_restart_trial_removed', 'purch_auto-card-update') then 'direct_to_paid' 
+                when txn_classify = 'purch_sub-change' then 'sub_change'
+                when txn_classify = 'recurring' then 'renewals'
+                else txn_classify
+            end as txn_classify
+
+            , count(distinct case when success_ind = 1 or invoice_state_desc = 'paid' then invoice_nbr else null end) as success_ct
+            , count(distinct case when success_ind = 0 and ifnull(invoice_state_desc, '') != 'paid' then invoice_nbr else null end) as decline_ct
+            , count(distinct invoice_nbr) as tot_ct
+            , round(safe_divide(count(distinct case when success_ind = 1 or invoice_state_desc = 'paid' then invoice_nbr else null end), count(distinct invoice_nbr)),5) as success_rate
+
+            , count(distinct case when (success_ind = 1 or invoice_state_desc = 'paid') and fraud_chk = 0 then invoice_nbr else null end) as no_fraud_success_ct
+            , count(distinct case when success_ind = 0 and ifnull(invoice_state_desc, '') != 'paid' and fraud_chk = 0 then invoice_nbr else null end) as no_fraud_decline_ct
+            , count(distinct case when fraud_chk = 0 then invoice_nbr else null end) as no_fraud_tot_ct
+            , round(safe_divide(count(distinct case when (success_ind = 1 or invoice_state_desc = 'paid') and fraud_chk = 0 then invoice_nbr else null end), count(distinct case when fraud_chk = 0 then invoice_nbr else null end)),5) as no_fraud_success_rate
+
+
+            , min(case when success_ind = 1 or invoice_state_desc = 'paid' then cast(invoice_nbr as string) else null end) as success_ex1
+            , max(case when success_ind = 1 or invoice_state_desc = 'paid' then cast(invoice_nbr as string) else null end) as success_ex2
+            
+            , min(case when success_ind = 0 and ifnull(invoice_state_desc, '') != 'paid' then cast(invoice_nbr as string) else null end) as decline_ex1
+            , max(case when success_ind = 0 and ifnull(invoice_state_desc, '') != 'paid' then cast(invoice_nbr as string) else null end) as decline_ex2
+
+            , min(case when success_ind = 0 and ifnull(invoice_state_desc, '') != 'paid' and fraud_chk = 0 then cast(invoice_nbr as string) else null end) as no_fraud_decline_ex1
+            , max(case when success_ind = 0 and ifnull(invoice_state_desc, '') != 'paid' and fraud_chk = 0 then cast(invoice_nbr as string) else null end) as no_fraud_decline_ex2
+
+        from dtls 
+        where 1=1 
+        group by all
+
     )
 
 -- , all_recs as 

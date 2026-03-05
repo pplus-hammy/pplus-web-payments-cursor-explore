@@ -1,4 +1,92 @@
-with txn as
+with sub as
+    (
+        select
+            case
+                when datetime(sub.expiration_dt_ut, 'America/New_York') between date_add(date_trunc(current_datetime('America/New_York'), DAY), INTERVAL -1 SECOND) and datetime('2999-12-01 23:59:59') then 'canceled'
+                when datetime(sub.expiration_dt_ut, 'America/New_York') < date_trunc(current_datetime('America/New_York'), DAY) then 'expired'
+                when sub.expiration_dt_ut = timestamp('2999-12-31 23:59:59 UTC') then 'active'
+                else sub.status_desc
+            end as status_desc
+            , case
+                when sub.cancel_dt_ut between sub.curr_period_start_dt_ut and sub.curr_period_end_dt_ut
+                        and sub.cancel_dt_ut = sub.expiration_dt_ut
+                        and (
+                                (date(sub.curr_period_start_dt_ut) > date('2025-11-06') and date_diff(sub.expiration_dt_ut, sub.curr_period_start_dt_ut, DAY) = 27)
+                                or (date(sub.curr_period_start_dt_ut) <= date('2025-11-06') and date_diff(sub.expiration_dt_ut, sub.curr_period_start_dt_ut, DAY) = 28)
+                            )
+                    then 'involuntary_fail_dunning'
+                when sub.cancel_dt_ut between sub.curr_period_start_dt_ut and sub.curr_period_end_dt_ut
+                        and sub.cancel_dt_ut != sub.expiration_dt_ut
+                        and (
+                                (date(sub.curr_period_start_dt_ut) > date('2025-11-06') and date_diff(sub.expiration_dt_ut, sub.curr_period_start_dt_ut, DAY) = 27)
+                                or (date(sub.curr_period_start_dt_ut) <= date('2025-11-06') and date_diff(sub.expiration_dt_ut, sub.curr_period_start_dt_ut, DAY) = 28)
+                            )
+                    then 'voluntary_cancel_in_dunning_fail'
+                when sub.cancel_dt_ut between sub.curr_period_start_dt_ut and sub.curr_period_end_dt_ut
+                        and sub.cancel_dt_ut != sub.expiration_dt_ut
+                        and sub.curr_period_end_dt_ut = sub.expiration_dt_ut
+                    then 'voluntary_cancel_expire_end_of_cycle'
+                when sub.cancel_dt_ut = sub.expiration_dt_ut and sub.curr_period_start_dt_ut = sub.cancel_dt_ut
+                    then 'involuntary_gift_card_expired_no_more_credit'
+                when date(sub.cancel_dt_ut) = date('2999-12-31')
+                    then null
+                else 'voluntary_likely_agent_cancel'
+            end as cancel_chk
+            , datetime(sub.activate_dt_ut, 'America/New_York') as activate_dt_et
+            , sub.* except (status_desc)
+            , coalesce(lag(sub.expiration_dt_ut) over (partition by sub.src_system_id, sub.account_cd order by creation_dt_ut, activate_dt_ut, sub.expiration_dt_ut), timestamp('1900-01-01 00:00:01 UTC')) as prior_expiration
+            , max(case when sub.frn = 1 then sub.activate_dt_ut else null end) over (partition by sub.src_system_id, sub.account_cd order by creation_dt_ut, activate_dt_ut, sub.expiration_dt_ut) as original_activation
+        from
+            (
+                select
+                    sub.src_system_id
+                    , sub.account_cd
+                    , sub.subscription_guid
+                    , sub.plan_cd
+                    , sub.plan_nm
+                    , trim(split(regexp_replace(sub.plan_nm, r'\([^()]*\)',''), ' -')[offset(0)]) as base_plan_nm
+                    , regexp_extract(sub.plan_nm, r'\((.*?)\)') as plan_qualifier
+                    , case
+                        when lower(sub.plan_cd) like '%monthly%' then 'monthly'
+                        when lower(sub.plan_cd) like '%annual%' then 'annual'
+                        else 'other'
+                    end as plan_dur
+                    , sub.unit_amt
+                    , sub.currency_cd
+                    , sub.status_desc
+                    , sub.creation_dt_ut
+                    , sub.activate_dt_ut
+                    , sub.trial_start_dt_ut
+                    , sub.trial_end_dt_ut
+                    , sub.curr_period_start_dt_ut
+                    , sub.curr_period_end_dt_ut
+                    , coalesce(sub.cancel_dt_ut, timestamp('2999-12-31 23:59:59 UTC')) as cancel_dt_ut
+                    , case
+                        when sub.expiration_dt_ut is null and lower(sub.plan_cd) like '%monthly%' and date(sub.curr_period_end_dt_ut) <= date_add(current_date, interval -2 MONTH)
+                            then sub.curr_period_end_dt_ut
+                        when sub.expiration_dt_ut is null and lower(sub.plan_cd) like '%annual%' and date(sub.curr_period_end_dt_ut) <= date_add(current_date, interval -2 MONTH)
+                            then sub.curr_period_end_dt_ut
+                        when sub.expiration_dt_ut is null
+                            then timestamp('2999-12-31 23:59:59 UTC')
+                        else sub.expiration_dt_ut
+                    end as expiration_dt_ut
+                    , case when sub.src_system_id = 134 then date_add(sub.activate_dt_ut, interval -150 SECOND) else date_add(sub.activate_dt_ut, interval -120 SECOND) end as pre_activate
+                    , case when sub.src_system_id = 134 then date_add(sub.activate_dt_ut, interval 150 SECOND) else date_add(sub.activate_dt_ut, interval 120 SECOND) end as post_activate
+                    , date_add(sub.trial_end_dt_ut, interval -120 SECOND) as pre_trial_end
+                    , date_add(sub.trial_end_dt_ut, interval 120 SECOND) as post_trial_end
+                    , row_number() over (partition by sub.src_system_id, sub.account_cd order by sub.creation_dt_ut, sub.activate_dt_ut, ifnull(sub.expiration_dt_ut, timestamp('2999-12-31 23:59:59 UTC'))) as frn
+                    , row_number() over (partition by sub.src_system_id, sub.account_cd order by sub.creation_dt_ut desc, sub.activate_dt_ut desc, ifnull(sub.expiration_dt_ut, timestamp('2999-12-31 23:59:59 UTC')) desc) as lrn
+                    , lag(sub.plan_nm) over (partition by sub.src_system_id, sub.account_cd order by creation_dt_ut, activate_dt_ut, ifnull(sub.expiration_dt_ut, timestamp('2999-12-31 23:59:59 UTC'))) as prior_plan
+                    , coalesce(lag(sub.activate_dt_ut) over (partition by sub.src_system_id, sub.account_cd order by creation_dt_ut, activate_dt_ut, ifnull(sub.expiration_dt_ut, timestamp('2999-12-31 23:59:59 UTC'))), timestamp('1900-01-01 00:00:01 UTC')) as prior_activation
+                    , lead(sub.plan_nm) over (partition by sub.src_system_id, sub.account_cd order by creation_dt_ut, activate_dt_ut, ifnull(sub.expiration_dt_ut, timestamp('2999-12-31 23:59:59 UTC'))) as next_plan
+                    , coalesce(lead(sub.activate_dt_ut) over (partition by sub.src_system_id, sub.account_cd order by creation_dt_ut, activate_dt_ut, ifnull(sub.expiration_dt_ut, timestamp('2999-12-31 23:59:59 UTC'))), timestamp('2999-12-31 23:59:59 UTC')) as next_activation
+                from i-dss-streaming-data.payment_ops_vw.recurly_subscription_dim sub
+                where 1=1
+                    -- and src_system_id = 115
+            ) sub
+        where 1=1
+    )
+, txn as
     (
         select
             txn.src_system_id
@@ -46,15 +134,25 @@ with txn as
             , trans_msg_desc
             , reference_cd
         from i-dss-streaming-data.payment_ops_vw.recurly_transaction_fct txn
+        left join sub
+            on sub.src_system_id = txn.src_system_id
+            and sub.account_cd = txn.account_cd
+            and sub.subscription_guid = txn.subscription_guid
         where 1=1
             -- and txn.src_system_id = 115
             and txn.trans_dt >= date_add(current_date(), interval -4 month)
             and txn.trans_dt <= current_date()
             and txn.trans_type_desc in ('purchase', 'verify')
             and txn.trans_status_desc in ('success', 'void', 'declined')
-            and txn.origin_desc in ('api', 'token_api')
+            -- and txn.origin_desc in ('api', 'token_api')
             -- and txn.cc_first_6_nbr in ('601100', '601101', '414720')
             and txn.payment_method_desc = 'Credit Card'
+            and 
+                (
+                    sub.subscription_guid is not null
+                    or
+                    txn.subscription_guid is null
+                )
     )
 
 , run_dates as
@@ -149,7 +247,6 @@ with txn as
                 when (dv.daily_success_ct - bl.baseline_success_avg_ct) / nullif(bl.baseline_success_stddev_ct, 0) <= -<Parameters.Z-Score> then 'large_decrease'
                 else null
             end as success_chg_flag
-
             , bl.baseline_avg_ct
             , bl.baseline_stddev_ct
             , dv.daily_ct
@@ -160,7 +257,6 @@ with txn as
                 when (dv.daily_ct - bl.baseline_avg_ct) / nullif(bl.baseline_stddev_ct, 0) <= -<Parameters.Z-Score> then 'large_decrease'
                 else null
             end as chg_flag
-
             , bl.baseline_success_avs_fail_avg_ct
             , bl.baseline_success_avs_fail_stddev_ct
             , dv.daily_success_avs_fail_ct
@@ -171,7 +267,6 @@ with txn as
                 when (dv.daily_success_avs_fail_ct - bl.baseline_success_avs_fail_avg_ct) / nullif(bl.baseline_success_avs_fail_stddev_ct, 0) <= -<Parameters.Z-Score> then 'large_decrease'
                 else null
             end as success_avs_fail_chg_flag
-
             , bl.baseline_decline_avg_ct
             , bl.baseline_decline_stddev_ct
             , dv.daily_decline_ct
@@ -182,7 +277,6 @@ with txn as
                 when (dv.daily_decline_ct - bl.baseline_decline_avg_ct) / nullif(bl.baseline_decline_stddev_ct, 0) <= -<Parameters.Z-Score> then 'large_decrease'
                 else null
             end as decline_chg_flag
-
         from daily_volume dv
         join dow_baseline bl
             on dv.src_system_id = bl.src_system_id

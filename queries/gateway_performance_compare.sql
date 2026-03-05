@@ -650,12 +650,15 @@ select
     , trans_gateway_type_desc
     , category
     -- , cc_first_6_nbr
-    , sum(total_transactions) as total_transactions
+    
     , sum(successful_transactions) as successful_transactions
+    , sum(total_transactions) as total_transactions
     , round(safe_divide(sum(successful_transactions), nullif(sum(total_transactions), 0)), 5) as txn_success_rate
-    , sum(total_invoices) as total_invoices
+    
     , sum(successful_invoices) as successful_invoices
+    , sum(total_invoices) as total_invoices
     , round(safe_divide(sum(successful_invoices), nullif(sum(total_invoices), 0)), 5) as inv_success_rate
+
     , min(example_transaction_min) as example_transaction_min
     , max(example_transaction_max) as example_transaction_max
     , min(example_invoice_min) as example_invoice_min
